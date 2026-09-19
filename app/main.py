@@ -3,7 +3,7 @@ import hashlib
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
@@ -13,7 +13,7 @@ from . import chat
 from .ai import classify, write_first_message
 from .config import settings
 from .github import settings_ready
-from .db import ACCOUNT_ID_PATTERN, connection, ensure_account, init_db, utc_now
+from .db import ACCOUNT_ID_PATTERN, backup_database, connection, ensure_account, init_db, utc_now, vacuum
 from .mcp_client import HimalayasMCP, MCPError, authorization_url, authorized_accounts, exchange_code, oauth_status
 from .supabase_client import SupabaseError, SupabaseLedger
 
@@ -129,6 +129,21 @@ def update_env_file(values: dict) -> None:
         if field not in updated:
             lines.append(f"{field.upper()}={value}")
     env_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
+def account_label(account_id: str) -> str:
+    with connection() as conn:
+        row = conn.execute("SELECT label FROM accounts WHERE id=?", (account_id,)).fetchone()
+    return row["label"] if row else ""
+
+
+async def note_ledger(account_id: str, candidate: dict, status: str, message_id: int | None = None, body: str = "", error: str | None = None) -> None:
+    """Show a queued or failed first message in the shared ledger. Best effort: it must never stop queueing or sending."""
+    try:
+        details = {**candidate, "account_id": account_id, "account_label": account_label(account_id)}
+        await SupabaseLedger().record_status(details, status, message_id, body, error)
+    except Exception as exc:
+        print(f"Ledger status note failed for {candidate.get('external_id')}: {exc}")
 
 
 def parse_candidate(row) -> dict:
@@ -409,13 +424,22 @@ async def queue_campaign(account_id: str, request: CampaignRequest) -> dict:
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Message generation failed: {exc}") from exc
 
+    queued_notes = []
     for candidate, first in generated:
         with connection() as conn:
             conn.execute("UPDATE candidates SET suggested_role=?, category=? WHERE id=?", (first["role"], chat.category_for(first["role"]), candidate["id"]))
-            conn.execute("INSERT INTO messages (account_id, candidate_id, direction, body, status, send_after, stage, created_at) VALUES (?, ?, 'outbound', ?, 'scheduled', ?, ?, ?)",
-                         (account_id, candidate["id"], first["message"], next_send_at.isoformat(), chat.FIRST, utc_now()))
+            message_id = conn.execute("INSERT INTO messages (account_id, candidate_id, direction, body, status, send_after, stage, created_at) VALUES (?, ?, 'outbound', ?, 'scheduled', ?, ?, ?)",
+                                      (account_id, candidate["id"], first["message"], next_send_at.isoformat(), chat.FIRST, utc_now())).lastrowid
+        queued_notes.append((candidate, message_id, first["message"]))
         next_send_at += timedelta(seconds=settings.min_message_delay_seconds)
         created += 1
+    limit = asyncio.Semaphore(5)
+
+    async def note(candidate: dict, message_id: int, body: str) -> None:
+        async with limit:
+            await note_ledger(account_id, candidate, "queued", message_id, body)
+
+    await asyncio.gather(*(note(*item) for item in queued_notes))
     publish_dashboard_update("messages_scheduled", account_id)
     return {"queued": created, "skipped": skipped, "first_send_at": (next_send_at - timedelta(seconds=settings.min_message_delay_seconds)).isoformat() if created else None}
 
@@ -510,7 +534,7 @@ async def conversations(account: Account) -> list[dict]:
 @app.get("/api/conversations/{candidate_id}")
 async def conversation(candidate_id: int, account: Account) -> dict:
     with connection() as conn:
-        candidate = conn.execute("SELECT id, name, category, summary, github_username, github_email, github_invited_at FROM candidates WHERE id=? AND account_id=?", (candidate_id, account)).fetchone()
+        candidate = conn.execute("SELECT id, name, category, summary, profile_url, suggested_role, github_username, github_email, github_invited_at FROM candidates WHERE id=? AND account_id=?", (candidate_id, account)).fetchone()
         messages = conn.execute(
             "SELECT id, direction, body, status, created_at, sent_at, send_after, error FROM messages WHERE candidate_id=? AND status != 'superseded' ORDER BY created_at, id",
             (candidate_id,),
@@ -530,6 +554,222 @@ async def mark_conversation_read(candidate_id: int, account: Account) -> dict:
     if updated:
         publish_dashboard_update("conversation_read", account)
     return {"marked_read": updated}
+
+
+# ---- Database view (per account) ----
+
+LEDGER_COLUMNS = [
+    ("id", "bigint", True), ("talent_slug", "text", False), ("candidate_name", "text", False), ("profile_url", "text", False),
+    ("summary", "text", False), ("category", "text", False), ("stack", "jsonb", False), ("message_id", "bigint", False),
+    ("message_body", "text", False), ("status", "text", False), ("error", "text", False), ("account_id", "text", False),
+    ("account_label", "text", False), ("sent_at", "timestamptz", False), ("created_at", "timestamptz", False), ("updated_at", "timestamptz", False),
+]
+TABLE_INFO = [
+    ("accounts", "Chrome profiles that use this server"),
+    ("candidates", "Members imported from Himalayas, with the role suggested for each"),
+    ("messages", "Every message sent to or received from a member"),
+]
+
+
+@app.get("/api/db/structure")
+async def db_structure(account: Account) -> dict:
+    tables = []
+    with connection() as conn:
+        for name, description in TABLE_INFO:
+            columns = [
+                {"name": row["name"], "type": (row["type"] or "TEXT").upper(), "primary_key": bool(row["pk"]), "required": bool(row["notnull"])}
+                for row in conn.execute(f"PRAGMA table_info({name})")
+                if row["name"] != "account_id" or name != "accounts"
+            ]
+            if name == "accounts":
+                rows = 1
+            else:
+                rows = conn.execute(f"SELECT COUNT(*) FROM {name} WHERE account_id=?", (account,)).fetchone()[0]
+            tables.append({"name": name, "description": description, "rows": rows, "columns": columns})
+    try:
+        ledger_ready = await SupabaseLedger().status_ready()
+    except Exception:
+        ledger_ready = None  # Supabase is not configured or not reachable
+    return {
+        "tables": tables,
+        "ledger_status_ready": ledger_ready,
+        "links": ["messages.candidate_id → candidates.id", "candidates.account_id → accounts.id", "messages.account_id → accounts.id"],
+        "external": {
+            "name": settings.supabase_table,
+            "description": "Shared contact ledger on Supabase. One row per member who was contacted. Every account checks it before a first message.",
+            "columns": [{"name": name, "type": kind.upper(), "primary_key": pk, "required": False} for name, kind, pk in LEDGER_COLUMNS],
+        },
+        "note": "Row counts are for this Chrome profile only. Login tokens are stored in the database but never shown here.",
+    }
+
+
+def member_rows(account_id: str) -> list[dict]:
+    """One row for every member who was reached (has at least one outbound message), with the outreach status."""
+    with connection() as conn:
+        candidates = conn.execute("SELECT id, name, suggested_role, category, github_username, github_invited_at FROM candidates WHERE account_id=?", (account_id,)).fetchall()
+        messages = conn.execute(
+            "SELECT id, candidate_id, direction, status, stage, error, sent_at, created_at FROM messages WHERE account_id=? AND status != 'superseded' ORDER BY created_at, id",
+            (account_id,),
+        ).fetchall()
+    by_candidate: dict[int, list] = {}
+    for message in messages:
+        by_candidate.setdefault(message["candidate_id"], []).append(message)
+    members = []
+    for candidate in candidates:
+        history = by_candidate.get(candidate["id"], [])
+        outbound = [m for m in history if m["direction"] == "outbound"]
+        if not outbound:
+            continue
+        # Outreach = the first-contact message. A sent one wins, otherwise the latest attempt.
+        first_contact = [m for m in outbound if m["stage"] in (None, chat.FIRST)] or outbound
+        outreach = next((m for m in first_contact if m["status"] == "sent"), first_contact[-1])
+        sent = sorted((m for m in outbound if m["status"] == "sent"), key=lambda m: (m["sent_at"] or m["created_at"], m["id"]))
+        stage = (sent[-1]["stage"] or chat.FIRST) if sent else None
+        failed = next((m for m in reversed(outbound) if m["status"] == "failed"), None)
+        members.append({
+            "id": candidate["id"], "name": candidate["name"], "role": candidate["suggested_role"], "category": candidate["category"],
+            "outreach_status": outreach["status"], "outreach_error": outreach["error"], "outreach_message_id": outreach["id"],
+            "outreach_sent_at": outreach["sent_at"], "last_status": outbound[-1]["status"], "stage": stage,
+            "replies": sum(1 for m in history if m["direction"] == "inbound"),
+            "last_activity": max((m["sent_at"] or m["created_at"]) for m in history),
+            "github_username": candidate["github_username"], "github_invited_at": candidate["github_invited_at"],
+            "failed_message_id": failed["id"] if failed and outbound[-1]["status"] == "failed" else None,
+            "failed_error": failed["error"] if failed and outbound[-1]["status"] == "failed" else None,
+        })
+    members.sort(key=lambda item: item["last_activity"], reverse=True)
+    return members
+
+
+@app.get("/api/db/members")
+async def db_members(account: Account, status: str | None = None, q: str | None = None, limit: int = Query(default=200, ge=1, le=1000)) -> dict:
+    members = member_rows(account)
+    summary: dict[str, int] = {}
+    for member in members:
+        summary[member["outreach_status"]] = summary.get(member["outreach_status"], 0) + 1
+    if status:
+        members = [m for m in members if m["outreach_status"] == status]
+    if q:
+        members = [m for m in members if q.lower() in m["name"].lower()]
+    return {"summary": {**summary, "total": sum(summary.values())}, "members": members[:limit], "matched": len(members)}
+
+
+# ---- Database cleanup (this account only) ----
+
+class CleanRequest(BaseModel):
+    mode: Literal["range", "all"]
+    from_time: str | None = None      # inclusive, ISO time
+    before_time: str | None = None    # exclusive, ISO time
+    dry_run: bool = True
+    confirm: str | None = None
+
+
+def parse_time(value: str | None, fallback: datetime | None = None) -> datetime | None:
+    if not value:
+        return fallback
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid date: {value}") from exc
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def stored_time(value: str | None) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value) if value else None
+    except ValueError:
+        parsed = None
+    if parsed is None:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def select_for_cleanup(account_id: str, request: CleanRequest) -> dict:
+    """Members whose last activity is in the range (or all members), with their message counts."""
+    start, end = parse_time(request.from_time), parse_time(request.before_time)
+    if request.mode == "range" and not (start or end):
+        raise HTTPException(status_code=400, detail="Choose at least one date")
+    if start and end and start >= end:
+        raise HTTPException(status_code=400, detail="The From date must be before the To date")
+    with connection() as conn:
+        candidates = conn.execute("SELECT id, created_at FROM candidates WHERE account_id=?", (account_id,)).fetchall()
+        messages = conn.execute("SELECT id, candidate_id, direction, status, external_id, sent_at, created_at FROM messages WHERE account_id=?", (account_id,)).fetchall()
+    by_candidate: dict[int, list] = {}
+    for message in messages:
+        by_candidate.setdefault(message["candidate_id"], []).append(message)
+    ids, message_rows = [], []
+    for candidate in candidates:
+        history = by_candidate.get(candidate["id"], [])
+        activity = max([stored_time(candidate["created_at"])] + [stored_time(m["sent_at"] or m["created_at"]) for m in history])
+        if request.mode == "all" or ((not start or activity >= start) and (not end or activity < end)):
+            ids.append(candidate["id"])
+            message_rows.extend(history)
+    by_status: dict[str, int] = {}
+    for message in message_rows:
+        if message["direction"] == "outbound":
+            by_status[message["status"]] = by_status.get(message["status"], 0) + 1
+    return {
+        "ids": ids, "messages": message_rows, "members": len(ids), "message_count": len(message_rows),
+        "cancelled": sum(by_status.get(status, 0) for status in ("scheduled", "approved", "queued")), "outbound_by_status": by_status,
+    }
+
+
+@app.post("/api/db/clean")
+async def db_clean(request: CleanRequest, account: Account) -> dict:
+    """Delete members and their messages. Preview first (dry_run), then confirm.
+    Login, settings, and the shared Supabase ledger are never touched, so nobody who was already contacted is messaged again."""
+    selection = select_for_cleanup(account, request)
+    summary = {"members": selection["members"], "messages": selection["message_count"], "queued_cancelled": selection["cancelled"], "outbound_by_status": selection["outbound_by_status"]}
+    if request.dry_run:
+        return {"dry_run": True, **summary}
+    if request.mode == "all" and request.confirm != "DELETE":
+        raise HTTPException(status_code=400, detail="Type DELETE to confirm deleting all data")
+    task = automation_tasks.get(account)
+    if task and not task.done():
+        raise HTTPException(status_code=409, detail="Stop the automatic campaign first")
+    if delivery_state(account)["current_id"]:
+        raise HTTPException(status_code=409, detail="A message is being sent right now. Try again in a few seconds")
+    if not selection["ids"]:
+        return {"dry_run": False, **summary, "backup": None}
+    backup = backup_database()
+    ids = selection["ids"]
+    seen_inbound = [(m["external_id"], account, utc_now()) for m in selection["messages"] if m["direction"] == "inbound" and m["external_id"]]
+    with connection() as conn:
+        # Remember replies that were already handled, so a re-imported member is not answered a second time.
+        conn.executemany("INSERT OR IGNORE INTO processed_inbound (external_id, account_id, deleted_at) VALUES (?, ?, ?)", seen_inbound)
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            marks = ",".join("?" * len(chunk))
+            conn.execute(f"DELETE FROM messages WHERE account_id=? AND candidate_id IN ({marks})", [account, *chunk])
+            conn.execute(f"DELETE FROM candidates WHERE account_id=? AND id IN ({marks})", [account, *chunk])
+    for candidate_id in ids:
+        candidate_locks.pop(candidate_id, None)
+        last_invitation_try.pop(candidate_id, None)
+    vacuum()
+    publish_dashboard_update("database_cleaned", account)
+    return {"dry_run": False, **summary, "backup": backup}
+
+
+@app.post("/api/messages/{message_id}/retry")
+async def retry_message(message_id: int, account: Account) -> dict:
+    send_after = (datetime.now(timezone.utc) + timedelta(seconds=5)).isoformat()
+    with connection() as conn:
+        updated = conn.execute(
+            "UPDATE messages SET status='scheduled', error=NULL, send_after=? WHERE id=? AND account_id=? AND status='failed'",
+            (send_after, message_id, account),
+        ).rowcount
+    if not updated:
+        raise HTTPException(status_code=404, detail="Failed message not found")
+    with connection() as conn:
+        row = conn.execute(
+            """SELECT m.id, m.candidate_id, m.body, c.external_id AS candidate_external_id, c.name AS candidate_name, c.profile_url AS candidate_profile_url,
+            c.summary AS candidate_summary, c.category AS candidate_category, c.stack_json AS candidate_stack_json
+            FROM messages m JOIN candidates c ON c.id=m.candidate_id WHERE m.id=?""",
+            (message_id,),
+        ).fetchone()
+    if row and message_id == await first_outbound_message_id(row["candidate_id"]):
+        await note_ledger(account, ledger_candidate(row), "queued", message_id, row["body"])
+    publish_dashboard_update("messages_scheduled", account)
+    return {"retried": True}
 
 
 @app.get("/api/events")
@@ -569,12 +809,13 @@ async def deliver(message_id: int) -> str:
     state["status"] = "sending"
     publish_dashboard_update("message_sending", account_id)
     state["current_name"] = row["candidate_name"]
+    first_contact = False
     try:
         first_contact = row["id"] == (await first_outbound_message_id(row["candidate_id"]))
         ledger = SupabaseLedger()
         if first_contact and await ledger.was_contacted(row["candidate_external_id"]):
             with connection() as conn:
-                conn.execute("UPDATE messages SET status='skipped' WHERE id=?", (message_id,))
+                conn.execute("UPDATE messages SET status='skipped', error='Already contacted (shared contact ledger)' WHERE id=?", (message_id,))
             state["status"] = "skipped"
             publish_dashboard_update("message_skipped", account_id)
             return "skipped"
@@ -600,10 +841,20 @@ async def deliver(message_id: int) -> str:
         with connection() as conn:
             conn.execute("UPDATE messages SET status='failed', error=? WHERE id=?", (str(exc), message_id))
         state.update({"status": "failed", "current_id": None, "current_name": None})
+        if first_contact:
+            await note_ledger(account_id, ledger_candidate(row), "failed", message_id, row["body"], str(exc))
         return "failed"
     state.update({"status": "sent", "current_id": None, "current_name": None})
     publish_dashboard_update("message_sent", account_id)
     return "sent"
+
+
+def ledger_candidate(row) -> dict:
+    """Candidate fields for the ledger, from a joined message row (see deliver)."""
+    return {
+        "external_id": row["candidate_external_id"], "name": row["candidate_name"], "profile_url": row["candidate_profile_url"],
+        "summary": row["candidate_summary"], "category": row["candidate_category"], "stack": json.loads(row["candidate_stack_json"]),
+    }
 
 
 async def first_outbound_message_id(candidate_id: int) -> int | None:
@@ -651,7 +902,10 @@ async def respond_to_inbound(account_id: str, candidate_row, body: str, external
     candidate_id = candidate_row["id"]
     async with candidate_locks.setdefault(candidate_id, asyncio.Lock()):
         with connection() as conn:
-            if external_id and conn.execute("SELECT 1 FROM messages WHERE external_id=?", (external_id,)).fetchone():
+            if external_id and (
+                conn.execute("SELECT 1 FROM messages WHERE external_id=?", (external_id,)).fetchone()
+                or conn.execute("SELECT 1 FROM processed_inbound WHERE external_id=?", (external_id,)).fetchone()
+            ):
                 return False
             history = [dict(item) for item in conn.execute(
                 "SELECT direction, body FROM messages WHERE candidate_id=? AND status NOT IN ('superseded', 'failed', 'skipped') ORDER BY created_at, id", (candidate_id,))]

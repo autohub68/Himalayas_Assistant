@@ -1,5 +1,6 @@
 import re
 import sqlite3
+from pathlib import Path
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
@@ -90,6 +91,11 @@ def init_db() -> None:
                 stage TEXT,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS processed_inbound (
+                external_id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                deleted_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS oauth_state (
                 state TEXT PRIMARY KEY,
                 account_id TEXT NOT NULL DEFAULT '',
@@ -160,6 +166,38 @@ def migrate(conn: sqlite3.Connection) -> None:
             "INSERT OR IGNORE INTO accounts (id, label, created_at) VALUES (?, 'Existing data', ?)",
             (LEGACY_ACCOUNT, utc_now()),
         )
+
+
+BACKUPS_TO_KEEP = 5
+
+
+def backup_database() -> str:
+    """Copy the database next to itself before a cleanup, keep the newest few copies, and return the file name."""
+    path = Path(settings.database_path).resolve()
+    target = path.with_name(f"{path.name}.bak-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S-%f')}")
+    source = sqlite3.connect(path)
+    try:
+        destination = sqlite3.connect(target)
+        try:
+            source.backup(destination)
+        finally:
+            destination.close()
+    finally:
+        source.close()
+    for old in sorted(path.parent.glob(f"{path.name}.bak-*"))[:-BACKUPS_TO_KEEP]:
+        old.unlink(missing_ok=True)
+    return target.name
+
+
+def vacuum() -> None:
+    """Give the freed space back to the file. Skipped quietly if the database is busy."""
+    conn = sqlite3.connect(settings.database_path, isolation_level=None)
+    try:
+        conn.execute("VACUUM")
+    except sqlite3.OperationalError:
+        pass
+    finally:
+        conn.close()
 
 
 ACCOUNT_TABLES = ("candidates", "messages", "oauth_tokens", "oauth_state")

@@ -5,7 +5,7 @@ class Settings(BaseSettings):
     openrouter_api_key: str = ""
     openrouter_model: str = "deepseek/deepseek-v4-flash-0731"
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
-    himalayas_mcp_url: str = ""
+    himalayas_mcp_url: str = "https://mcp.himalayas.app/mcp"
     himalayas_mcp_token: str = ""
     himalayas_oauth_authorization_endpoint: str = "https://mcp.himalayas.app/authorize"
     himalayas_oauth_token_endpoint: str = "https://mcp.himalayas.app/oauth/token"

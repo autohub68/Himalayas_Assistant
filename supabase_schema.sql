@@ -14,9 +14,27 @@ create table if not exists public.outreach_contacts (
 
 alter table public.outreach_contacts enable row level security;
 
+drop policy if exists "service can manage outreach contacts" on public.outreach_contacts;
 create policy "service can manage outreach contacts"
 on public.outreach_contacts
 for all
 to anon
 using (true)
 with check (true);
+
+-- Outreach status (run once, safe to run again).
+-- Each member has one row. status is "queued" (first message scheduled), "sent", or "failed".
+-- Only "sent" counts as contacted. Existing rows are all sent, so they become "sent".
+alter table public.outreach_contacts add column if not exists status text not null default 'sent';
+alter table public.outreach_contacts add column if not exists error text;
+alter table public.outreach_contacts add column if not exists account_id text;
+alter table public.outreach_contacts add column if not exists account_label text;
+alter table public.outreach_contacts add column if not exists updated_at timestamptz not null default now();
+-- Queued and failed rows have no send time yet.
+alter table public.outreach_contacts alter column sent_at drop not null;
+alter table public.outreach_contacts alter column sent_at drop default;
+create index if not exists outreach_contacts_status_idx on public.outreach_contacts (status);
+create index if not exists outreach_contacts_account_idx on public.outreach_contacts (account_id);
+
+-- Nothing else is needed: the "service can manage outreach contacts" policy above already lets the app
+-- read, insert, and update rows, which is what status changes use.

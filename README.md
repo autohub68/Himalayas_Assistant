@@ -74,9 +74,35 @@ python3 -m venv ~/.venvs/him && ~/.venvs/him/bin/pip install -r requirements.txt
 
 Then reload the extension at `chrome://extensions`. If the systemd service from `install-service.sh` is installed, the button controls it; otherwise the helper starts uvicorn in the background (log: `~/.local/share/him/backend.log`). The extension ID is fixed by the `key` in `extension/manifest.json`, so the helper trusts only this extension. Windows is not covered by the installer.
 
-Before first use, run `supabase_schema.sql` in the Supabase SQL Editor. The send path fails closed until Supabase is reachable and the table exists.
+Before first use, run `supabase_schema.sql` in the Supabase SQL Editor. The send path fails closed until Supabase is reachable and the table exists. Run the file again after an update: it is safe to repeat, and its last part adds the outreach status columns.
+
+   **Ledger statuses.** The shared ledger has one row per member with a `status`: `queued` (first message scheduled), `sent`, or `failed` (with the error, the account, and when). Only `sent` counts as contacted, so a queued or failed row never blocks a member, and nothing ever overwrites a `sent` row. Until the status columns exist, the ledger works as before and stores sent contacts only, and the Database tab says so. The columns are detected again every minute, so no restart is needed after running the SQL.
 
 4. Load `extension/` in Chrome or Chromium at `chrome://extensions` using **Load unpacked** — select the `extension` folder itself, not the project root. As long as the background service is running (step 3), the extension works immediately — no separate server process to start each time.
+
+## Database dashboard and settings
+
+The **Database ↗** button in the extension popup opens a full-size dashboard in its own browser tab (`database.html`). Pressing it again reuses that tab. It shows this Chrome profile's data:
+
+- **Summary cards**: members reached, sent, failed, queued, skipped, and replied.
+- **Members table**: every member who was reached, with a status tag from their first message (**sent**, **failed**, **queued**, **skipped**), the suggested role, the chat step, replies, GitHub state, and last activity. A failed reply to a member who was reached shows a second **Reply failed** tag. Failed messages have a **Retry** button. Filter by status, search by name, sort by any column, and export the current list to CSV. The list refreshes every 15 seconds.
+- **Member details**: click a row to open a side panel with the member's profile link, suggested role, GitHub invitation state, profile text, and the whole conversation with a status tag on every message.
+- **Structure** (left side): the tables (accounts, candidates, messages) with columns, types, keys, and row counts for this profile, the shared Supabase contact ledger, and how the tables link. Login tokens are never shown.
+- **Clean up** (left side): delete members and all of their messages from this Chrome profile, either **by date** (from and to, by each member's last activity, or open-ended on one side) or **everything**. Press **Preview** first: it shows exactly how many members and messages will go and how many queued messages will be cancelled. Deleting everything needs the word `DELETE` typed exactly. Before anything is removed, a backup copy of the database is saved next to it as `hiring.db.bak-<date>` (the newest 5 are kept), and the file is compacted afterward.
+
+The popup's Settings tab keeps only what is needed: account name, OpenRouter API key, Supabase URL and key, GitHub token, owner and repository, and the seconds between first messages. Advanced values (AI model, MCP URL, polling intervals, concurrency) keep good defaults and can still be set in `.env`.
+
+What a cleanup keeps and protects:
+
+- Your Himalayas login, your account, and all settings stay.
+- Other Chrome profiles' data is never touched.
+- The shared Supabase ledger is not changed, so a cleaned member who was already contacted is still skipped and never messaged twice, even if imported again.
+- Replies that were already handled are remembered, so an old reply is not answered a second time after a member is re-imported.
+- A cleanup is refused while the automatic campaign is running or a message is being sent. Stop the campaign first.
+
+To undo a cleanup, stop the server and copy a `hiring.db.bak-...` file over `hiring.db`.
+
+Endpoints: `GET /api/db/structure`, `GET /api/db/members?status=&q=`, `POST /api/messages/{id}/retry`, `POST /api/db/clean` (`dry_run` previews).
 
 ## Several Himalayas accounts (one Chrome profile each)
 

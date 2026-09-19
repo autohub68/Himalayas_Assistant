@@ -22,12 +22,12 @@ async function request(path, options = {}) {
   if (!response.ok) throw new Error(await response.text());
   return response.json();
 }
-const settingFields = ['openrouter_api_key', 'openrouter_model', 'openrouter_base_url', 'himalayas_mcp_url', 'himalayas_mcp_token', 'supabase_url', 'supabase_key', 'supabase_table', 'github_token', 'github_api_url', 'github_owner', 'github_repo', 'auto_send', 'min_message_delay_seconds', 'max_message_delay_seconds', 'delivery_poll_interval_seconds', 'reply_poll_interval_seconds', 'reply_processing_concurrency', 'profile_fetch_concurrency', 'message_generation_concurrency'];
+const settingFields = ['openrouter_api_key', 'supabase_url', 'supabase_key', 'github_token', 'github_owner', 'github_repo', 'min_message_delay_seconds'];
 async function loadSettings() {
   const [values, account] = await Promise.all([request('/api/settings'), request('/api/account')]);
   $('account_label').value = account.label || '';
   $('account-id').textContent = `Account id: ${account.id}`;
-  const secretFields = ['openrouter_api_key', 'himalayas_mcp_token', 'supabase_key', 'github_token'];
+  const secretFields = ['openrouter_api_key', 'supabase_key', 'github_token'];
   settingFields.forEach((field) => {
     if (secretFields.includes(field)) {
       $(field).value = '';
@@ -37,17 +37,11 @@ async function loadSettings() {
     }
   });
 }
+const TABS = ['dashboard', 'chats', 'settings'];
 function showTab(tab) {
-  const dashboard = tab === 'dashboard';
-  const chats = tab === 'chats';
-  $('dashboard-panel').hidden = !dashboard;
-  $('chats-panel').hidden = !chats;
-  $('settings-panel').hidden = dashboard || chats;
-  $('dashboard-tab').classList.toggle('active', dashboard);
-  $('chats-tab').classList.toggle('active', chats);
-  $('settings-tab').classList.toggle('active', !dashboard && !chats);
-  if (chats) loadConversations().catch(() => { $('conversation-list').innerHTML = '<p class="chat-empty">Could not load conversations.</p>'; });
-  if (!dashboard && !chats) loadSettings().catch(() => { $('settings-result').textContent = 'Could not load settings.'; });
+  TABS.forEach((name) => { $(`${name}-panel`).hidden = name !== tab; $(`${name}-tab`).classList.toggle('active', name === tab); });
+  if (tab === 'chats') loadConversations().catch(() => { $('conversation-list').innerHTML = '<p class="chat-empty">Could not load conversations.</p>'; });
+  if (tab === 'settings') loadSettings().catch(() => { $('settings-result').textContent = 'Could not load settings.'; });
 }
 function formatTime(value) {
   if (!value) return 'pending';
@@ -136,8 +130,10 @@ $('server-toggle').onclick = async () => {
 $('auth').onclick = async () => { window.open(`${API}/api/auth/start?account_id=${encodeURIComponent(await accountReady)}`, '_blank'); };
 $('dashboard-tab').onclick = () => showTab('dashboard');
 $('chats-tab').onclick = () => showTab('chats');
+// The database opens as its own full-size page (new tab). window.open with a fixed name reuses that tab if it is already open.
+$('database-tab').onclick = () => { window.open(chrome.runtime.getURL('database.html'), 'hiring-database'); };
 $('settings-tab').onclick = () => showTab('settings');
-$('save-settings').onclick = async () => { const button = $('save-settings'); button.disabled = true; $('settings-result').textContent = 'Saving...'; const values = {}; settingFields.forEach((field) => { const value = $(field).value.trim(); if (value) values[field] = ['min_message_delay_seconds', 'max_message_delay_seconds', 'delivery_poll_interval_seconds', 'reply_poll_interval_seconds', 'reply_processing_concurrency', 'profile_fetch_concurrency', 'message_generation_concurrency'].includes(field) ? Number(value) : field === 'auto_send' ? value === 'true' : value; }); try { await request('/api/settings', {method: 'PUT', body: JSON.stringify(values)}); await request('/api/account', {method: 'PUT', body: JSON.stringify({label: $('account_label').value.trim()})}); $('settings-result').textContent = 'Settings saved.'; } catch (error) { $('settings-result').textContent = `Save failed: ${error.message}`; } finally { button.disabled = false; } };
+$('save-settings').onclick = async () => { const button = $('save-settings'); button.disabled = true; $('settings-result').textContent = 'Saving...'; const values = {}; settingFields.forEach((field) => { const value = $(field).value.trim(); if (value) values[field] = field === 'min_message_delay_seconds' ? Number(value) : value; }); try { await request('/api/settings', {method: 'PUT', body: JSON.stringify(values)}); await request('/api/account', {method: 'PUT', body: JSON.stringify({label: $('account_label').value.trim()})}); $('settings-result').textContent = 'Settings saved.'; } catch (error) { $('settings-result').textContent = `Save failed: ${error.message}`; } finally { button.disabled = false; } };
 async function connectDashboardEvents() {
   const source = new EventSource(`${API}/api/events?account_id=${encodeURIComponent(await accountReady)}`);
   source.addEventListener('dashboard-update', refresh);
