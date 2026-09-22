@@ -19,8 +19,9 @@ class Settings(BaseSettings):
     mcp_list_messages_tool: str = "list_messages"
     database_path: str = "./hiring.db"
     auto_send: bool = False
-    min_message_delay_seconds: int = 180
-    max_message_delay_seconds: int = 1800
+    min_message_delay_seconds: int = 30
+    max_message_delay_seconds: int = 120
+    daily_dm_limit: int = 0  # new members messaged per day, for each profile. 0 = no limit
     delivery_poll_interval_seconds: int = 5
     profile_fetch_concurrency: int = 4
     message_generation_concurrency: int = 3
@@ -33,6 +34,11 @@ class Settings(BaseSettings):
     github_api_url: str = "https://api.github.com"
     github_owner: str = ""
     github_repo: str = ""
+    # Remote access to the Control center. Requests from this machine need no password. Any other request needs this login.
+    # With no password set, remote requests are refused. SERVER_HOST=0.0.0.0 makes the server reachable from other machines.
+    server_host: str = "127.0.0.1"
+    admin_username: str = "admin"
+    admin_password: str = ""
 
     model_config = SettingsConfigDict(
         env_file=(".env", "/home/star/.local/share/him/settings.env"),

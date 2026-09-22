@@ -119,3 +119,6 @@ h3{margin:14px 0 2px;font-size:12px;color:var(--lime)}
 .bubble.outbound{margin-left:auto;background:#263b25}
 .bubble .meta{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:8px;color:var(--muted);font:10px 'DM Mono',monospace}
 .bubble .who{color:var(--dim);font:10px 'DM Mono',monospace;text-transform:uppercase;margin-bottom:5px}
+
+.himal{display:block;font-weight:700;font-size:12px}.himal.ok{color:var(--lime)}.himal.bad{color:var(--orange)}
+#verify-result{min-height:16px}

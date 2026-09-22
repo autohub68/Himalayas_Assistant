@@ -1,23 +1,128 @@
 import asyncio
+import base64
 import hashlib
+import hmac
 import json
+import os
+import random
+import secrets
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Literal
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
-from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
+import httpx
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse, RedirectResponse, Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import chat
+from . import chat, playbook, prompted
 from .ai import classify, write_first_message
 from .config import settings
 from .github import settings_ready
-from .db import ACCOUNT_ID_PATTERN, backup_database, connection, ensure_account, init_db, utc_now, vacuum
-from .mcp_client import HimalayasMCP, MCPError, authorization_url, authorized_accounts, exchange_code, oauth_status
+from .db import ACCOUNT_ID_PATTERN, backup_database, connection, ensure_account, get_state, init_db, set_state, utc_now, vacuum
+from .mcp_client import result_text, AlreadyMessaged, ConversationUnavailable, HimalayasMCP, HimalayasUnavailable, letters_only, HimalayasRejected, LoginExpired, MCPError, authorization_url, authorized_accounts, exchange_code, login_state, oauth_status
 from .supabase_client import SupabaseError, SupabaseLedger
 
+LOCAL_CLIENTS = {"127.0.0.1", "::1", "localhost", "testclient"}  # "testclient" is the address the test client reports. A real connection never has it
+LOGIN_FAILURES_BEFORE_BLOCK = 8
+LOGIN_BLOCK_SECONDS = 600
+failed_logins: dict[str, list[float]] = {}
+
+
+SESSION_DAYS = 7
+SESSION_COOKIE = "him_session"
+OPEN_PATHS = {"/login", "/api/login", "/api/logout"}  # reachable without a login (the login page and its calls)
+
+
+def session_key() -> bytes:
+    """Signs the login cookie. It comes from the login itself, so a new password ends every session, and nothing needs storing."""
+    return hashlib.sha256(f"him-session|{settings.admin_username}|{settings.admin_password}".encode()).digest()
+
+
+def make_session() -> str:
+    expires = str(int(time.time()) + SESSION_DAYS * 86400)
+    return f"{expires}.{hmac.new(session_key(), expires.encode(), hashlib.sha256).hexdigest()}"
+
+
+def valid_session(value: str) -> bool:
+    expires, _, signature = value.partition(".")
+    if not expires.isdigit() or int(expires) < time.time() or not settings.admin_password:
+        return False
+    return secrets.compare_digest(signature, hmac.new(session_key(), expires.encode(), hashlib.sha256).hexdigest())
+
+
+def cookie_value(header: str, name: str) -> str:
+    for part in header.split(";"):
+        key, _, value = part.strip().partition("=")
+        if key == name:
+            return value
+    return ""
+
+
+def login_address(headers: dict, client: str) -> str:
+    return (headers.get("x-forwarded-for") or headers.get("forwarded") or client).split(",")[0].strip()
+
+
+def login_blocked(address: str) -> bool:
+    now = time.monotonic()
+    failed_logins[address] = [t for t in failed_logins.get(address, []) if now - t < LOGIN_BLOCK_SECONDS]
+    return len(failed_logins[address]) >= LOGIN_FAILURES_BEFORE_BLOCK
+
+
+def credentials_ok(user: str, password: str) -> bool:
+    return bool(settings.admin_password) and bool(secrets.compare_digest(user.encode(), settings.admin_username.encode()) & secrets.compare_digest(password.encode(), settings.admin_password.encode()))
+
+
+class RemoteAccessGuard:
+    """Requests from this machine (the extension, the local browser) pass. Every other request needs to be signed in: a login cookie
+    from the login page, or HTTP Basic for scripts. A request that came through a proxy counts as remote, even though the proxy itself is local.
+    A browser page request without a login goes to the login page. A script or API call gets 401."""
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] not in ("http", "websocket"):
+            return await self.app(scope, receive, send)
+        headers = {key.decode("latin-1").lower(): value.decode("latin-1") for key, value in scope["headers"]}
+        client = (scope.get("client") or ("", 0))[0]
+        forwarded = headers.get("x-forwarded-for") or headers.get("forwarded")
+        path = scope.get("path", "")
+        if (client in LOCAL_CLIENTS and not forwarded) or path in OPEN_PATHS:
+            return await self.app(scope, receive, send)
+        address = login_address(headers, client)
+        if settings.admin_password:
+            if valid_session(cookie_value(headers.get("cookie", ""), SESSION_COOKIE)):
+                return await self.app(scope, receive, send)
+            given = headers.get("authorization", "")
+            if given.lower().startswith("basic ") and not login_blocked(address):
+                try:
+                    user, _, password = base64.b64decode(given.split(" ", 1)[1]).decode("utf-8").partition(":")
+                except Exception:
+                    user = password = ""
+                if credentials_ok(user, password):
+                    failed_logins.pop(address, None)
+                    return await self.app(scope, receive, send)
+                failed_logins[address] = failed_logins.get(address, []) + [time.monotonic()]
+        if scope["type"] == "websocket":
+            return await send({"type": "websocket.close", "code": 1008})
+        wants_page = scope.get("method") == "GET" and "text/html" in headers.get("accept", "") and not path.startswith("/api/")
+        if not settings.admin_password:
+            status, message, extra = 403, "Remote access is off. Set ADMIN_PASSWORD in settings.env on the server.", []
+        elif wants_page:
+            await send({"type": "http.response.start", "status": 302, "headers": [(b"location", b"/login"), (b"content-length", b"0")]})
+            return await send({"type": "http.response.body", "body": b""})
+        else:
+            status, message, extra = 401, "Login required", []
+        body = json.dumps({"detail": message}).encode()
+        await send({"type": "http.response.start", "status": status, "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode()), *extra]})
+        await send({"type": "http.response.body", "body": body})
+
+
 app = FastAPI(title="Himalayas Hiring Assistant", version="0.1.0")
+app.add_middleware(RemoteAccessGuard)
 reply_monitor_task: asyncio.Task | None = None
 # One backend serves every extension (one per Chrome profile / Himalayas account). All runtime state is kept per account.
 automation_tasks: dict[str, asyncio.Task] = {}
@@ -39,13 +144,32 @@ def delivery_state(account_id: str) -> dict:
     return delivery_states.setdefault(account_id, {"running": True, "status": "idle", "current_id": None, "current_name": None})
 
 
-def optional_account(x_account_id: Annotated[str | None, Header()] = None, account_id: str | None = Query(default=None)) -> str | None:
+last_seen_written: dict[str, float] = {}
+
+
+def touch_seen(account_id: str) -> None:
+    """Remember when an extension last called the server. Written to the database at most every 30 seconds."""
+    now = time.monotonic()
+    if now - last_seen_written.get(account_id, -1000.0) < 30:
+        return
+    last_seen_written[account_id] = now
+    with connection() as conn:
+        conn.execute("UPDATE accounts SET last_seen=? WHERE id=?", (utc_now(), account_id))
+
+
+def optional_account(
+    x_account_id: Annotated[str | None, Header()] = None,
+    x_admin: Annotated[str | None, Header()] = None,
+    account_id: str | None = Query(default=None),
+) -> str | None:
     value = x_account_id or account_id
     if value is None:
         return None
     if not ACCOUNT_ID_PATTERN.match(value):
         raise HTTPException(status_code=400, detail="Invalid account id")
     ensure_account(value)
+    if not x_admin:  # the admin dashboard acts on an account, but it is not that account's extension
+        touch_seen(value)
     return value
 
 
@@ -84,6 +208,7 @@ class SettingsUpdate(BaseModel):
     min_message_delay_seconds: int | None = Field(default=None, ge=5, le=86400)
     max_message_delay_seconds: int | None = Field(default=None, ge=5, le=86400)
     reply_poll_interval_seconds: int | None = Field(default=None, ge=10, le=3600)
+    daily_dm_limit: int | None = Field(default=None, ge=0, le=100000)
     delivery_poll_interval_seconds: int | None = Field(default=None, ge=1, le=300)
     profile_fetch_concurrency: int | None = Field(default=None, ge=1, le=20)
     message_generation_concurrency: int | None = Field(default=None, ge=1, le=20)
@@ -137,13 +262,17 @@ def account_label(account_id: str) -> str:
     return row["label"] if row else ""
 
 
-async def note_ledger(account_id: str, candidate: dict, status: str, message_id: int | None = None, body: str = "", error: str | None = None) -> None:
-    """Show a queued or failed first message in the shared ledger. Best effort: it must never stop queueing or sending."""
+async def note_ledger(account_id: str, candidate: dict, status: str, message_id: int | None = None, body: str = "", error: str | None = None) -> bool:
+    """Show a queued or failed first message in the shared ledger. Best effort: it must never stop queueing or sending.
+
+    Returns False when a "queued" claim was refused because another account already sent or queued this member.
+    """
     try:
         details = {**candidate, "account_id": account_id, "account_label": account_label(account_id)}
-        await SupabaseLedger().record_status(details, status, message_id, body, error)
+        return await SupabaseLedger().record_status(details, status, message_id, body, error)
     except Exception as exc:
         print(f"Ledger status note failed for {candidate.get('external_id')}: {exc}")
+        return True  # do not cancel local work when the ledger itself is unreachable
 
 
 def parse_candidate(row) -> dict:
@@ -153,9 +282,9 @@ def parse_candidate(row) -> dict:
 
 
 def publish_dashboard_update(reason: str, account_id: str) -> None:
-    event = {"reason": reason, "at": utc_now()}
+    event = {"reason": reason, "account_id": account_id, "at": utc_now()}
     for subscriber, subscriber_account in tuple(dashboard_subscribers.items()):
-        if subscriber_account != account_id:
+        if subscriber_account not in (account_id, "*"):
             continue
         try:
             subscriber.put_nowait(event)
@@ -164,33 +293,71 @@ def publish_dashboard_update(reason: str, account_id: str) -> None:
 
 
 def compact_scheduled_queue() -> None:
-    # Each account has its own send pacing, so queues are re-spaced per account.
+    """At startup, first messages that are waiting become due right away. The gap between them is enforced when they are sent
+    (`next_first_message_at`), so the schedule must not hold its own spacing: a spacing fixed at queue time goes stale when the
+    interval setting changes, or after a pause or a restart. Replies keep their own delay."""
     with connection() as conn:
-        for account in conn.execute("SELECT DISTINCT account_id FROM messages WHERE direction='outbound' AND status='scheduled'").fetchall():
-            rows = conn.execute(
-                "SELECT id FROM messages WHERE account_id=? AND direction='outbound' AND status='scheduled' ORDER BY send_after, id",
-                (account["account_id"],),
-            ).fetchall()
-            next_send_at = datetime.now(timezone.utc) + timedelta(seconds=5)
-            for row in rows:
-                conn.execute("UPDATE messages SET send_after=? WHERE id=?", (next_send_at.isoformat(), row["id"]))
-                next_send_at += timedelta(seconds=settings.min_message_delay_seconds)
+        conn.execute(
+            "UPDATE messages SET send_after=? WHERE direction='outbound' AND status='scheduled' AND stage='first_sent' AND send_after > ? AND " + TRUE_FIRST_SQL,
+            ((datetime.now(timezone.utc) + timedelta(seconds=5)).isoformat(),) * 2,
+        )
+
+
+def restore_cooldowns() -> None:
+    """After a restart, keep the gap since the last first message that was sent. It is remembered only in memory otherwise."""
+    with connection() as conn:
+        rows = conn.execute("SELECT account_id, MAX(sent_at) AS last FROM messages WHERE direction='outbound' AND status='sent' AND stage='first_sent' AND sent_at IS NOT NULL GROUP BY account_id").fetchall()
+    for row in rows:
+        elapsed = (datetime.now(timezone.utc) - stored_time(row["last"])).total_seconds()
+        remaining = first_message_gap() - elapsed
+        if remaining > 0:
+            next_first_message_at[row["account_id"]] = time.monotonic() + remaining
+
+
+async def supervised(name: str, factory) -> None:
+    """Run a background loop for ever. If it crashes for any reason it starts again after a few seconds. Only a shutdown ends it."""
+    crashes = 0
+    while True:
+        try:
+            await factory()
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            crashes += 1
+            loop_crashes[name] = {"count": crashes, "last": f"{type(exc).__name__}: {str(exc)[:160]}", "at": utc_now()}
+            print(f"Background loop '{name}' crashed ({exc!r}). Starting it again in 5 seconds.")
+            await asyncio.sleep(5)
+
+
+loop_crashes: dict[str, dict] = {}
 
 
 @app.on_event("startup")
 async def startup() -> None:
     global reply_monitor_task
     init_db()
+    playbook.load_active()
     compact_scheduled_queue()
-    asyncio.create_task(delivery_loop())
-    reply_monitor_task = asyncio.create_task(reply_monitor_loop())
+    restore_cooldowns()
+    upgrade_pending_intros()
+    asyncio.create_task(supervised("delivery", delivery_loop))
+    asyncio.create_task(supervised("himalayas check", himalayas_check_loop))
+    reply_monitor_task = asyncio.create_task(supervised("reply monitor", reply_monitor_loop))
+    resume_automation()
 
 
 @app.get("/api/health")
 async def health(account_id: Annotated[str | None, Depends(optional_account)]) -> dict:
     if account_id is None:
         return {"ok": True}
-    return {"ok": True, "auto_send": settings.auto_send, "himalayas_authorized": oauth_status(account_id), "automation": automation_state(account_id), "reply_monitor": reply_monitor_state(account_id), "delivery": delivery_state(account_id)}
+    return {"ok": True, "auto_send": settings.auto_send, "himalayas_authorized": oauth_status(account_id), "himalayas_login": login_state(account_id), "hold": hold_reason(account_id), "paused": is_paused(account_id), "automation": automation_state(account_id), "reply_monitor": reply_monitor_state(account_id), "delivery": delivery_state(account_id), "loop_restarts": loop_crashes, "daily": daily_status(account_id), "company": get_state(f"himalayas_company:{account_id}")}
+
+
+def is_paused(account_id: str) -> bool:
+    with connection() as conn:
+        row = conn.execute("SELECT paused FROM accounts WHERE id=?", (account_id,)).fetchone()
+    return bool(row and row["paused"])
 
 
 class AccountUpdate(BaseModel):
@@ -201,7 +368,7 @@ class AccountUpdate(BaseModel):
 async def get_account_info(account: Account) -> dict:
     with connection() as conn:
         row = conn.execute("SELECT id, label FROM accounts WHERE id=?", (account,)).fetchone()
-    return {**dict(row), "himalayas_authorized": oauth_status(account)}
+    return {**dict(row), "himalayas_authorized": oauth_status(account), "himalayas_login": login_state(account)}
 
 
 @app.put("/api/account")
@@ -229,19 +396,129 @@ async def get_settings() -> dict:
     return public_settings()
 
 
+WRONG_KEY_PREFIXES = {
+    "supabase_key": (("sk-or-", "an OpenRouter key"), ("ghp_", "a GitHub token"), ("github_pat_", "a GitHub token"), ("gho_", "a GitHub token")),
+    "openrouter_api_key": (("ghp_", "a GitHub token"), ("github_pat_", "a GitHub token"), ("eyJ", "a Supabase key")),
+    "github_token": (("sk-or-", "an OpenRouter key"), ("eyJ", "a Supabase key")),
+}
+SECRET_LABELS = {"openrouter_api_key": "OpenRouter API key", "supabase_key": "Supabase key", "github_token": "GitHub token"}
+
+
+async def check_settings(values: dict) -> tuple[list[str], list[str]]:
+    """Refuse a secret that is clearly the wrong kind, a copy of another secret, or rejected by its own service.
+    Returns (errors, warnings). Errors stop the save. A service that cannot be reached only gives a warning."""
+    errors: list[str] = []
+    warnings: list[str] = []
+    effective = lambda name: values.get(name, getattr(settings, name))
+    for name, prefixes in WRONG_KEY_PREFIXES.items():
+        value = values.get(name)
+        for prefix, kind in prefixes if value else ():
+            if value.startswith(prefix):
+                errors.append(f"The {SECRET_LABELS[name]} field contains {kind}. Paste the correct value.")
+    for name in SECRET_LABELS:
+        if name in values and any(other != name and effective(other) == values[name] for other in SECRET_LABELS if effective(other)):
+            other = next(o for o in SECRET_LABELS if o != name and effective(o) == values[name])
+            errors.append(f"The {SECRET_LABELS[name]} and the {SECRET_LABELS[other]} contain the same value. Browser autofill may have filled one of them.")
+    if "supabase_url" in values and values["supabase_url"] and not values["supabase_url"].startswith("https://"):
+        errors.append("The Supabase URL must start with https://")
+    if errors:
+        return errors, warnings
+    async with httpx.AsyncClient(timeout=15) as client:
+        if ("supabase_key" in values or "supabase_url" in values) and effective("supabase_url") and effective("supabase_key"):
+            key = effective("supabase_key")
+            try:
+                response = await client.get(f"{effective('supabase_url').rstrip('/')}/rest/v1/{effective('supabase_table')}", params={"select": "id", "limit": 1}, headers={"apikey": key, "Authorization": f"Bearer {key}"})
+                if response.status_code in (401, 403):
+                    errors.append(f"Supabase rejected this key ({response.status_code}). Use the anon (publishable) key from Supabase > Project Settings > API.")
+                elif response.status_code == 404:
+                    warnings.append("Supabase accepted the key, but the contact table was not found. Run supabase_schema.sql in the Supabase SQL Editor.")
+                elif response.is_error:
+                    warnings.append(f"Supabase answered {response.status_code}, so the key could not be verified.")
+            except httpx.HTTPError:
+                warnings.append("Could not reach Supabase to verify the key.")
+        if values.get("openrouter_api_key"):
+            try:
+                response = await client.get(f"{effective('openrouter_base_url').rstrip('/')}/auth/key", headers={"Authorization": f"Bearer {values['openrouter_api_key']}"})
+                if response.status_code in (401, 403):
+                    errors.append(f"OpenRouter rejected this API key ({response.status_code}).")
+            except httpx.HTTPError:
+                warnings.append("Could not reach OpenRouter to verify the key.")
+        if any(name in values for name in ("github_token", "github_owner", "github_repo")) and effective("github_token"):
+            headers = {"Accept": "application/vnd.github+json", "Authorization": f"Bearer {effective('github_token')}", "X-GitHub-Api-Version": "2022-11-28"}
+            base = effective("github_api_url").rstrip("/")
+            try:
+                response = await client.get(f"{base}/user", headers=headers)
+                if response.status_code in (401, 403):
+                    errors.append(f"GitHub rejected this token ({response.status_code}).")
+                elif effective("github_owner") and effective("github_repo"):
+                    repo = await client.get(f"{base}/repos/{effective('github_owner')}/{effective('github_repo')}", headers=headers)
+                    if repo.status_code == 404:
+                        errors.append(f"GitHub cannot find the repository {effective('github_owner')}/{effective('github_repo')}, or the token has no access to it.")
+                    elif not repo.is_error and not (repo.json().get("permissions") or {}).get("admin"):
+                        warnings.append("The token can see the repository but may not be allowed to add collaborators. Invitations need admin access.")
+            except httpx.HTTPError:
+                warnings.append("Could not reach GitHub to verify the token.")
+    return errors, warnings
+
+
+# Settings that are checked together against one outside service. A wrong value in one group never stops another group from being saved.
+SETTING_GROUPS = {
+    "GitHub": {"github_token", "github_owner", "github_repo", "github_api_url"},
+    "Supabase": {"supabase_url", "supabase_key", "supabase_table"},
+    "OpenRouter": {"openrouter_api_key", "openrouter_model", "openrouter_base_url"},
+}
+
+
+def duplicate_secret_errors(values: dict) -> dict[str, str]:
+    """Two secrets changed to the same value in one save is almost always browser autofill. (A secret that copies an already saved one is
+    caught by the group check.) Returns {setting name: message} for the second one."""
+    found = {}
+    names = [n for n in SECRET_LABELS if n in values]
+    for index, name in enumerate(names):
+        other = next((o for o in names[:index] if values[o] == values[name]), None)
+        if other:
+            found[name] = f"The {SECRET_LABELS[name]} and the {SECRET_LABELS[other]} contain the same value. Browser autofill may have filled one of them."
+    return found
+
+
 @app.put("/api/settings")
 async def save_settings(update: SettingsUpdate) -> dict:
+    """Save what changed. A value that is the same as the saved one is left alone and not checked again. Each group (GitHub, Supabase,
+    OpenRouter, everything else) is checked and saved on its own, so one wrong value cannot undo the other changes in the same save."""
     values = update.model_dump(exclude_none=True)
     for name, value in list(values.items()):
         if name in SECRET_SETTINGS and (not value or set(value) == {"•"} or value == masked(getattr(settings, name))):
             values.pop(name, None)
+        elif getattr(settings, name) == value:
+            values.pop(name, None)  # nothing changed
+    problems: list[str] = []
+    warnings: list[str] = []
+    for name, message in duplicate_secret_errors(values).items():
+        problems.append(message)
+        values.pop(name, None)
+    saved: dict = {}
+    buckets = {label: {n: v for n, v in values.items() if n in names} for label, names in SETTING_GROUPS.items()}
+    buckets["other"] = {n: v for n, v in values.items() if not any(n in names for names in SETTING_GROUPS.values())}
+    for label, group in buckets.items():
+        if not group:
             continue
+        errors, group_warnings = ([], []) if label == "other" else await check_settings(group)
+        warnings += group_warnings
+        if errors:  # this group is not saved, so a wrong value can never replace a working one
+            problems += [f"{label} not saved: {error}" for error in errors]
+        else:
+            saved.update(group)
+    if problems and not saved:
+        raise HTTPException(status_code=400, detail=" ".join(problems))
+    for name, value in saved.items():
         setattr(settings, name, value)
-    if values:
-        update_env_file(values)
+    if saved:
+        update_env_file(saved)
+        holds.pop("ledger", None)  # a new key may fix the problem. Try again right away.
+        SupabaseLedger._status_ready = None
         for subscriber_account in set(dashboard_subscribers.values()):
             publish_dashboard_update("settings_updated", subscriber_account)
-    return public_settings()
+    return {**public_settings(), "warnings": warnings, "errors": problems, "saved": sorted(saved)}
 
 
 @app.get("/api/auth/start")
@@ -275,10 +552,35 @@ async def candidates(account: Account, page: int | None = None) -> list[dict]:
     return items
 
 
+def locally_handled(account_id: str, slugs: list[str]) -> set[str]:
+    """Members of this list that already have a message that is sent, waiting or skipped, or that the bot gave up on."""
+    if not slugs:
+        return set()
+    with connection() as conn:
+        rows = conn.execute(
+            "SELECT c.external_id FROM candidates c WHERE c.account_id=? AND c.external_id IN ({}) AND EXISTS (SELECT 1 FROM messages m WHERE m.candidate_id=c.id AND m.direction='outbound' "
+            "AND (m.status IN ('sent', 'scheduled', 'approved', 'skipped') OR (m.status='failed' AND m.error LIKE 'Gave up:%')))".format(",".join("?" * len(slugs))),
+            (account_id, *slugs),
+        ).fetchall()
+    return {row["external_id"] for row in rows}
+
+
 async def import_candidates(account_id: str, page: int) -> dict:
+    """Read one page of members. Members who are already contacted or claimed (local database, or sent/queued
+    in the shared ledger) are recognised first and are not fetched again, so a page of people you already
+    messaged costs one search and one ledger lookup, not one request for every member."""
     try:
         client = HimalayasMCP(account_id)
-        imported = await client.list_candidates(page)
+        listed = await client.list_candidates(page)
+        slugs = [item["talent_slug"] for item in listed if item.get("talent_slug")]
+        handled = locally_handled(account_id, slugs)
+        rest = [slug for slug in slugs if slug not in handled]
+        if rest and settings.supabase_url and settings.supabase_key:
+            try:
+                handled |= await SupabaseLedger().contacted_among(rest)
+            except Exception:
+                pass
+        imported = [item for item in listed if item.get("talent_slug") not in handled]
         semaphore = asyncio.Semaphore(settings.profile_fetch_concurrency)
 
         async def enrich(item: dict) -> dict:
@@ -311,7 +613,7 @@ async def import_candidates(account_id: str, page: int) -> dict:
                  json.dumps(stack), category, json.dumps(item), now, now),
             )
     publish_dashboard_update("candidates_synced", account_id)
-    return {"imported": len(imported)}
+    return {"imported": len(listed), "fresh": len(imported), "already_contacted": len(listed) - len(imported)}
 
 
 @app.post("/api/candidates/sync")
@@ -330,33 +632,82 @@ async def page_has_pending_messages(account_id: str, page: int) -> bool:
     return row is not None
 
 
-async def automatic_campaign(account_id: str) -> None:
-    page = 1
+AUTOMATION_RETRY_SECONDS = (30, 60, 120, 300)  # pause after an error. Automation never gives up. Only the Stop button stops it.
+
+
+def automation_key(account_id: str) -> str:
+    return f"automation:{account_id}"
+
+
+def remember_automation(account_id: str, page: int | None) -> None:
+    """Automation that is running is written to the database, so a restart of the server continues it. None = it is not running."""
+    set_state(automation_key(account_id), json.dumps({"page": page}) if page else "")
+
+
+async def automatic_campaign(account_id: str, page: int = 1) -> None:
     state = automation_state(account_id)
     state.update({"running": True, "page": page, "status": "syncing", "queued": 0})
+    remember_automation(account_id, page)
+    errors_in_a_row = 0
     try:
         while True:
-            state["page"] = page
-            state["status"] = "syncing"
-            sync_result = await import_candidates(account_id, page)
-            if not sync_result["imported"]:
-                state["status"] = "complete"
-                break
-            state["status"] = "queueing"
-            campaign_result = await queue_campaign(account_id, CampaignRequest(page=page))
-            state["queued"] += campaign_result["queued"]
-            state["status"] = "sending"
-            while await page_has_pending_messages(account_id, page):
-                await asyncio.sleep(5)
-            page += 1
+            try:
+                state["page"] = page
+                state["status"] = "syncing"
+                remember_automation(account_id, page)
+                sync_result = await import_candidates(account_id, page)
+                if not sync_result["imported"]:
+                    state["status"] = "complete"
+                    remember_automation(account_id, None)  # every page is done
+                    break
+                if not sync_result.get("fresh", sync_result["imported"]):
+                    # Everyone on this page was contacted before. There is nothing to write or to wait for: go straight to the next page.
+                    state["status"] = f"skipping page {page}: all {sync_result['already_contacted']} members already contacted"
+                    page += 1
+                    await asyncio.sleep(0.2)
+                    continue
+                state["status"] = "queueing"
+                campaign_result = await queue_campaign(account_id, CampaignRequest(page=page))
+                state["queued"] += campaign_result["queued"]
+                state["status"] = "sending"
+                while await page_has_pending_messages(account_id, page):
+                    await asyncio.sleep(5)
+                page += 1
+                errors_in_a_row = 0
+                state.pop("last_error", None)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Any error (Himalayas down, network, a bad response) only pauses the automation. It tries the same page again.
+                pause = AUTOMATION_RETRY_SECONDS[min(errors_in_a_row, len(AUTOMATION_RETRY_SECONDS) - 1)]
+                errors_in_a_row += 1
+                state["last_error"] = {"message": str(exc)[:200], "at": utc_now()}
+                state["status"] = f"retrying in {pause}s: {str(exc)[:120]}"
+                print(f"Automation for {account_id} hit an error on page {page}, retrying in {pause}s: {exc!r}")
+                publish_dashboard_update("automation_error", account_id)
+                await asyncio.sleep(pause)
     except asyncio.CancelledError:
         state["status"] = "stopped"
         raise
-    except Exception as exc:
-        state["status"] = f"failed: {exc}"
     finally:
         state["running"] = False
         state["page"] = page
+
+
+def resume_automation() -> None:
+    """After a restart of the server: continue the automation that was running."""
+    with connection() as conn:
+        rows = conn.execute("SELECT key, value FROM app_state WHERE key LIKE 'automation:%' AND value != ''").fetchall()
+    for row in rows:
+        account_id = row["key"].split(":", 1)[1]
+        try:
+            page = max(1, int(json.loads(row["value"]).get("page") or 1))
+        except (ValueError, TypeError, AttributeError):
+            page = 1
+        task = automation_tasks.get(account_id)
+        if not task or task.done():
+            automation_tasks[account_id] = asyncio.create_task(automatic_campaign(account_id, page))
+            print(f"Automation for {account_id} continues from page {page}.")
 
 
 @app.post("/api/automation/start")
@@ -372,6 +723,7 @@ async def start_automation(account: Account) -> dict:
 @app.post("/api/automation/stop")
 async def stop_automation(account: Account) -> dict:
     task = automation_tasks.get(account)
+    remember_automation(account, None)  # a stop from the person is the only thing that ends the automation
     if task and not task.done():
         task.cancel()
         automation_state(account)["status"] = "stopping"
@@ -382,15 +734,8 @@ async def stop_automation(account: Account) -> dict:
 async def queue_campaign(account_id: str, request: CampaignRequest) -> dict:
     created = 0
     skipped = 0
+    # Every new first message is due now. The gap between first messages is enforced when they are sent, in the order they were queued.
     next_send_at = datetime.now(timezone.utc)
-    with connection() as conn:
-        latest = conn.execute(
-            "SELECT send_after FROM messages WHERE account_id=? AND direction='outbound' AND status IN ('scheduled', 'approved') AND send_after IS NOT NULL ORDER BY send_after DESC LIMIT 1",
-            (account_id,),
-        ).fetchone()
-    if latest:
-        latest_send_at = datetime.fromisoformat(latest["send_after"])
-        next_send_at = max(next_send_at, latest_send_at + timedelta(seconds=settings.min_message_delay_seconds))
     if request.page is not None:
         with connection() as conn:
             rows = conn.execute("SELECT * FROM candidates WHERE account_id=?", (account_id,)).fetchall()
@@ -408,16 +753,33 @@ async def queue_campaign(account_id: str, request: CampaignRequest) -> dict:
         candidate = parse_candidate(row)
         with connection() as conn:
             already_contacted = conn.execute("SELECT 1 FROM messages WHERE candidate_id=? AND direction='outbound' AND status != 'failed' LIMIT 1", (candidate["id"],)).fetchone()
-        if already_contacted:
+            # Himalayas cannot reopen this member's conversation. Trying again only adds another failure, so wait for Himalayas to fix it.
+            unreachable = conn.execute("SELECT 1 FROM messages WHERE candidate_id=? AND direction='outbound' AND status='failed' AND (error LIKE 'Himalayas cannot reopen%' OR error LIKE 'Gave up:%') LIMIT 1", (candidate["id"],)).fetchone()
+        if already_contacted or unreachable:
             skipped += 1
             continue
         eligible_rows.append(candidate)
 
+    # Shared ledger: members already sent or claimed (queued) by another profile must not get a second first message.
+    if eligible_rows and settings.supabase_url and settings.supabase_key:
+        try:
+            claimed = await SupabaseLedger().contacted_among([c["external_id"] for c in eligible_rows])
+        except Exception:
+            claimed = set()
+        if claimed:
+            before = len(eligible_rows)
+            eligible_rows = [c for c in eligible_rows if c["external_id"] not in claimed]
+            skipped += before - len(eligible_rows)
+
     semaphore = asyncio.Semaphore(settings.message_generation_concurrency)
+
+    recent = recent_first_messages(account_id)
 
     async def generate(candidate: dict) -> tuple[dict, dict]:
         async with semaphore:
-            return candidate, await write_first_message(candidate)
+            first = await write_first_message(candidate, recent=list(recent))
+            recent.insert(0, first["message"])  # the messages written after this one must differ from it too
+            return candidate, first
 
     try:
         generated = await asyncio.gather(*(generate(candidate) for candidate in eligible_rows))
@@ -431,17 +793,26 @@ async def queue_campaign(account_id: str, request: CampaignRequest) -> dict:
             message_id = conn.execute("INSERT INTO messages (account_id, candidate_id, direction, body, status, send_after, stage, created_at) VALUES (?, ?, 'outbound', ?, 'scheduled', ?, ?, ?)",
                                       (account_id, candidate["id"], first["message"], next_send_at.isoformat(), chat.FIRST, utc_now())).lastrowid
         queued_notes.append((candidate, message_id, first["message"]))
-        next_send_at += timedelta(seconds=settings.min_message_delay_seconds)
-        created += 1
     limit = asyncio.Semaphore(5)
 
-    async def note(candidate: dict, message_id: int, body: str) -> None:
+    async def note(candidate: dict, message_id: int, body: str) -> bool:
         async with limit:
-            await note_ledger(account_id, candidate, "queued", message_id, body)
+            claimed = await note_ledger(account_id, candidate, "queued", message_id, body)
+            if claimed is False:
+                # Another profile claimed this member while we were writing. Do not leave a sendable local copy.
+                with connection() as conn:
+                    conn.execute(
+                        "UPDATE messages SET status='skipped', error=? WHERE id=? AND status='scheduled'",
+                        ("Already claimed by another profile (shared contact ledger)", message_id),
+                    )
+                return False
+            return True
 
-    await asyncio.gather(*(note(*item) for item in queued_notes))
+    claimed_ok = await asyncio.gather(*(note(*item) for item in queued_notes))
+    created = sum(1 for ok in claimed_ok if ok)
+    skipped += sum(1 for ok in claimed_ok if not ok)
     publish_dashboard_update("messages_scheduled", account_id)
-    return {"queued": created, "skipped": skipped, "first_send_at": (next_send_at - timedelta(seconds=settings.min_message_delay_seconds)).isoformat() if created else None}
+    return {"queued": created, "skipped": skipped, "first_send_at": next_send_at.isoformat() if created else None}
 
 
 @app.post("/api/campaigns")
@@ -490,6 +861,7 @@ async def progress(account: Account) -> dict:
         "latest_recipient": latest["name"] if latest else None,
         "latest_status": latest["status"] if latest else None,
         "latest_error": latest["error"] if latest else None,
+        "daily": daily_status(account),
     }
 
 
@@ -517,6 +889,9 @@ async def conversations(account: Account) -> list[dict]:
             (SELECT status FROM messages WHERE candidate_id=c.id ORDER BY created_at DESC, id DESC LIMIT 1) AS last_status,
             (SELECT COUNT(*) FROM messages WHERE candidate_id=c.id AND direction='inbound' AND read_at IS NULL) AS unread_count,
             EXISTS(SELECT 1 FROM messages WHERE candidate_id=c.id AND direction='inbound') AS has_reply,
+            MAX(CASE WHEN m.direction='inbound' THEN m.created_at END) AS last_reply_at,
+            (SELECT body FROM messages WHERE candidate_id=c.id AND direction='inbound' ORDER BY created_at DESC, id DESC LIMIT 1) AS last_reply,
+            MAX(CASE WHEN m.direction='inbound' OR m.status='sent' THEN COALESCE(m.sent_at, m.created_at) END) AS real_activity,
             EXISTS(SELECT 1 FROM messages WHERE candidate_id=c.id AND direction='outbound' AND status IN ('scheduled', 'approved')) AS response_scheduled
             FROM candidates c JOIN messages m ON m.candidate_id=c.id
             WHERE c.account_id=?
@@ -526,8 +901,17 @@ async def conversations(account: Account) -> list[dict]:
     result = []
     for row in rows:
         item = dict(row)
+        item["last_reply"] = (item["last_reply"] or "")[:160] or None
         item["conversation_status"] = "response scheduled" if item["response_scheduled"] else "new reply" if item["has_reply"] and item["last_direction"] == "inbound" else "awaiting reply" if item["last_direction"] == "outbound" and item["last_status"] == "sent" else item["last_status"] or "no activity"
         result.append(item)
+    # Members who wrote to us come first: an unread reply on top (newest first), then everyone who ever replied, then the rest.
+    # Queued or failed messages are not activity, so a batch of queued messages never pushes a reply down the list.
+    def recency(item: dict) -> tuple[str, str]:
+        return (item["last_reply_at"] if item["unread_count"] else item["real_activity"] or "", item["last_activity"] or "")
+    result.sort(key=recency, reverse=True)
+    result.sort(key=lambda item: 0 if item["unread_count"] else 1 if item["has_reply"] else 2)
+    for item in result:
+        item.pop("real_activity", None)
     return result
 
 
@@ -547,9 +931,13 @@ async def conversation(candidate_id: int, account: Account) -> dict:
 @app.post("/api/conversations/{candidate_id}/read")
 async def mark_conversation_read(candidate_id: int, account: Account) -> dict:
     with connection() as conn:
+        owned = conn.execute("SELECT 1 FROM candidates WHERE id=? AND account_id=?", (candidate_id, account)).fetchone()
+        if not owned:
+            raise HTTPException(status_code=404, detail="Candidate not found")
+        # Count unread by candidate (same as the inbox), not messages.account_id, so older rows with an empty account_id still clear.
         updated = conn.execute(
-            "UPDATE messages SET read_at=? WHERE candidate_id=? AND account_id=? AND direction='inbound' AND read_at IS NULL",
-            (utc_now(), candidate_id, account),
+            "UPDATE messages SET read_at=? WHERE candidate_id=? AND direction='inbound' AND read_at IS NULL",
+            (utc_now(), candidate_id),
         ).rowcount
     if updated:
         publish_dashboard_update("conversation_read", account)
@@ -606,9 +994,12 @@ async def db_structure(account: Account) -> dict:
 def member_rows(account_id: str) -> list[dict]:
     """One row for every member who was reached (has at least one outbound message), with the outreach status."""
     with connection() as conn:
-        candidates = conn.execute("SELECT id, name, suggested_role, category, github_username, github_invited_at FROM candidates WHERE account_id=?", (account_id,)).fetchall()
+        checks = {row["candidate_id"]: row for row in conn.execute("SELECT * FROM himalayas_check WHERE account_id=?", (account_id,))}
+        candidates = conn.execute("SELECT id, name, external_id, profile_url, suggested_role, category, github_username, github_invited_at FROM candidates WHERE account_id=?", (account_id,)).fetchall()
         messages = conn.execute(
-            "SELECT id, candidate_id, direction, status, stage, error, sent_at, created_at FROM messages WHERE account_id=? AND status != 'superseded' ORDER BY created_at, id",
+            """SELECT m.id, m.candidate_id, m.direction, m.status, m.stage, m.error, m.sent_at, m.created_at, m.read_at, m.body
+            FROM messages m JOIN candidates c ON c.id=m.candidate_id
+            WHERE c.account_id=? AND m.status != 'superseded' ORDER BY m.created_at, m.id""",
             (account_id,),
         ).fetchall()
     by_candidate: dict[int, list] = {}
@@ -620,6 +1011,10 @@ def member_rows(account_id: str) -> list[dict]:
         outbound = [m for m in history if m["direction"] == "outbound"]
         if not outbound:
             continue
+        inbound = [m for m in history if m["direction"] == "inbound"]
+        unread_count = sum(1 for m in inbound if not m["read_at"])
+        last_reply = (inbound[-1]["body"] or "")[:160] if inbound else None
+        last_reply_at = inbound[-1]["created_at"] if inbound else None
         # Outreach = the first-contact message. A sent one wins, otherwise the latest attempt.
         first_contact = [m for m in outbound if m["stage"] in (None, chat.FIRST)] or outbound
         outreach = next((m for m in first_contact if m["status"] == "sent"), first_contact[-1])
@@ -630,13 +1025,22 @@ def member_rows(account_id: str) -> list[dict]:
             "id": candidate["id"], "name": candidate["name"], "role": candidate["suggested_role"], "category": candidate["category"],
             "outreach_status": outreach["status"], "outreach_error": outreach["error"], "outreach_message_id": outreach["id"],
             "outreach_sent_at": outreach["sent_at"], "last_status": outbound[-1]["status"], "stage": stage,
-            "replies": sum(1 for m in history if m["direction"] == "inbound"),
+            "replies": len(inbound), "unread_count": unread_count,
+            "last_reply": last_reply, "last_reply_at": last_reply_at,
             "last_activity": max((m["sent_at"] or m["created_at"]) for m in history),
             "github_username": candidate["github_username"], "github_invited_at": candidate["github_invited_at"],
+            "profile_url": candidate["profile_url"], "slug": candidate["external_id"],
+            "himalayas": ({"checked_at": checks[candidate["id"]]["checked_at"], "room": checks[candidate["id"]]["room"], "total": checks[candidate["id"]]["total"], "ours": checks[candidate["id"]]["ours"],
+                           "theirs": checks[candidate["id"]]["theirs"], "read": checks[candidate["id"]]["ours_read"], "ok": bool(checks[candidate["id"]]["matches"]), "note": checks[candidate["id"]]["note"]}
+                          if candidate["id"] in checks else None),
             "failed_message_id": failed["id"] if failed and outbound[-1]["status"] == "failed" else None,
             "failed_error": failed["error"] if failed and outbound[-1]["status"] == "failed" else None,
         })
-    members.sort(key=lambda item: item["last_activity"], reverse=True)
+    # Unread replies first (newest unread on top), then the rest by last activity.
+    def recency(item: dict) -> str:
+        return item["last_reply_at"] if item["unread_count"] else item["last_activity"] or ""
+    members.sort(key=recency, reverse=True)
+    members.sort(key=lambda item: 0 if item["unread_count"] else 1)
     return members
 
 
@@ -644,13 +1048,406 @@ def member_rows(account_id: str) -> list[dict]:
 async def db_members(account: Account, status: str | None = None, q: str | None = None, limit: int = Query(default=200, ge=1, le=1000)) -> dict:
     members = member_rows(account)
     summary: dict[str, int] = {}
+    unread_total = 0
     for member in members:
         summary[member["outreach_status"]] = summary.get(member["outreach_status"], 0) + 1
-    if status:
+        unread_total += int(member.get("unread_count") or 0)
+    if status == "unread":
+        members = [m for m in members if m.get("unread_count")]
+    elif status:
         members = [m for m in members if m["outreach_status"] == status]
     if q:
         members = [m for m in members if q.lower() in m["name"].lower()]
-    return {"summary": {**summary, "total": sum(summary.values())}, "members": members[:limit], "matched": len(members)}
+    return {
+        "summary": {**summary, "total": sum(summary.values()), "unread": unread_total},
+        "members": members[:limit],
+        "matched": len(members),
+    }
+
+
+# ---- Admin dashboard: every account (one per Chrome profile / extension) in one place ----
+
+ADMIN_DIR = Path(os.environ.get("HIM_ADMIN_DIR") or Path(__file__).parent / "admin")
+
+
+class LoginRequest(BaseModel):
+    username: str = ""
+    password: str = ""
+
+
+@app.get("/login")
+async def login_page() -> HTMLResponse:
+    return HTMLResponse((ADMIN_DIR / "login.html").read_text(encoding="utf-8"), headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/login")
+async def login(body: LoginRequest, request: Request) -> Response:
+    if not settings.admin_password:
+        raise HTTPException(status_code=403, detail="Remote access is off. Set ADMIN_PASSWORD in settings.env on the server.")
+    headers = {key.lower(): value for key, value in request.headers.items()}
+    address = login_address(headers, request.client.host if request.client else "")
+    if login_blocked(address):
+        raise HTTPException(status_code=429, detail=f"Too many wrong passwords. Try again in {LOGIN_BLOCK_SECONDS // 60} minutes.")
+    if not credentials_ok(body.username.strip(), body.password):
+        failed_logins[address] = failed_logins.get(address, []) + [time.monotonic()]
+        raise HTTPException(status_code=401, detail="Wrong username or password.")
+    failed_logins.pop(address, None)
+    response = Response(json.dumps({"ok": True}), media_type="application/json")
+    response.set_cookie(SESSION_COOKIE, make_session(), max_age=SESSION_DAYS * 86400, httponly=True, samesite="strict", path="/")
+    return response
+
+
+@app.post("/api/logout")
+async def logout() -> Response:
+    response = Response(json.dumps({"ok": True}), media_type="application/json")
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    return response
+
+
+def ago(value: str | None) -> str:
+    seconds = max(0, int((datetime.now(timezone.utc) - stored_time(value)).total_seconds())) if value else 0
+    return "just now" if seconds < 90 else f"{seconds // 60} min ago" if seconds < 5400 else f"{seconds // 3600} h ago"
+
+
+def account_overview(account_id: str, label: str, paused: bool, last_seen: str | None) -> dict:
+    members = member_rows(account_id)
+    by_status: dict[str, int] = {}
+    for member in members:
+        by_status[member["outreach_status"]] = by_status.get(member["outreach_status"], 0) + 1
+    with connection() as conn:
+        imported = conn.execute("SELECT COUNT(*) FROM candidates WHERE account_id=?", (account_id,)).fetchone()[0]
+        next_message = conn.execute(
+            """SELECT c.name, m.send_after FROM messages m JOIN candidates c ON c.id=m.candidate_id
+            WHERE m.account_id=? AND m.direction='outbound' AND m.status IN ('scheduled', 'approved') ORDER BY m.send_after, m.id LIMIT 1""",
+            (account_id,),
+        ).fetchone()
+        unread = conn.execute(
+            """SELECT COUNT(*) FROM messages m JOIN candidates c ON c.id=m.candidate_id
+            WHERE c.account_id=? AND m.direction='inbound' AND m.read_at IS NULL""",
+            (account_id,),
+        ).fetchone()[0]
+    login = login_state(account_id)
+    authorized = login == "connected"
+    automation = automation_state(account_id)
+    monitor = reply_monitor_state(account_id)
+    failed_followups = sum(1 for m in members if m["failed_message_id"] and m["outreach_status"] != "failed")
+    alerts = []
+    if unread:
+        alerts.append(f"{unread} unread {'reply' if unread == 1 else 'replies'}")
+    if login == "expired":
+        alerts.append("Himalayas login expired: press Reconnect Himalayas")
+    elif login == "none":
+        alerts.append("Himalayas is not connected")
+    if paused:
+        alerts.append("Sending is paused")
+    if hold_reason(account_id):
+        alerts.append(f"Sending on hold: {hold_reason(account_id)}")
+    today = daily_status(account_id)
+    if today["reached"]:
+        alerts.append(daily_limit_reason(today))
+    unreachable = sum(1 for m in members if m["outreach_status"] == "failed" and (m.get("outreach_error") or "").startswith("Himalayas cannot reopen"))
+    if by_status.get("failed", 0) - unreachable > 0:
+        alerts.append(f"{by_status['failed'] - unreachable} failed first message(s)")
+    if unreachable:  # start_conversation could not reopen the room and no usable room was found another way
+        alerts.append(f"{unreachable} member(s) cannot be reached: Himalayas could not open their conversation")
+    if failed_followups:
+        alerts.append(f"{failed_followups} failed reply(ies)")
+    # Errors are shown with their age, because the last error stays in memory until the next run. Login problems are
+    # reported above from the real login state, so they are not repeated here.
+    if str(automation["status"]).startswith("failed") and authorized:
+        alerts.append(f"Automation failed {ago(automation.get('failed_at'))}: {str(automation['status']).splitlines()[0][8:140]}")
+    if str(monitor["status"]).startswith("waiting for Himalayas") and authorized:
+        alerts.append(f"Waiting for Himalayas to answer ({str(monitor["status"]).splitlines()[0][22:120].strip()}). Replies are checked again every {settings.reply_poll_interval_seconds} seconds")
+    elif str(monitor["status"]).startswith("failed") and authorized:
+        alerts.append(f"Reply monitor failed: {str(monitor['status']).splitlines()[0][8:140]}")
+    return {
+        "id": account_id, "label": label, "paused": paused, "last_seen": last_seen, "himalayas_authorized": authorized, "himalayas_login": login,
+        "automation": automation, "delivery": delivery_state(account_id), "reply_monitor": monitor, "daily": today,
+        "imported": imported, "members": len(members), "by_status": by_status,
+        "replied": sum(1 for m in members if m["replies"]), "failed_followups": failed_followups, "unread": unread,
+        "next_send_at": next_message["send_after"] if next_message else None, "next_recipient": next_message["name"] if next_message else None,
+        "next_send_in": max(0.0, next_first_message_at.get(account_id, 0) - time.monotonic()),  # seconds the sender still waits before the next first message
+        "alerts": alerts,
+    }
+
+
+# ---- Playbook: the .md file that holds the company, roles, pay and message wording ----
+
+class PlaybookFile(BaseModel):
+    md: str
+    filename: str = "playbook.md"
+
+
+def check_playbook(md: str) -> tuple[dict, dict]:
+    if len(md.encode()) > playbook.MAX_BYTES:
+        raise HTTPException(status_code=413, detail="The file is too large. A playbook is a few pages of text.")
+    pb, errors, warnings, notes = playbook.parse(md)
+    report = {"ok": not errors, "errors": errors, "warnings": warnings, "notes": notes}
+    if not errors:
+        report["summary"] = playbook.summary(pb)
+        report["samples"] = playbook.samples(pb)
+        wants_github = "github" in pb["prompts"]["chat"].lower() if pb.get("mode") == "prompt" else any(role["type"] == "developer" for role in pb["roles"])
+        if wants_github and not settings_ready():
+            report["warnings"].append("This file uses GitHub invitations, but the GitHub token, owner and repository are not set in Settings. The AI is told that invitations are not available until they are.")
+    return pb, report
+
+
+def playbook_status() -> dict:
+    meta = playbook.meta()
+    with connection() as conn:
+        waiting = conn.execute("SELECT COUNT(*) FROM messages WHERE direction='outbound' AND status IN ('scheduled', 'approved')").fetchone()[0]
+    return {"company": "", "website": "", "careers_url": "", **playbook.summary(playbook.active()), "is_default": not playbook.get_state(playbook.STATE_MD), "filename": meta.get("filename"), "imported_at": meta.get("imported_at"), "queued_messages": waiting}
+
+
+@app.get("/api/admin/playbook")
+async def get_playbook() -> dict:
+    return playbook_status()
+
+
+@app.get("/api/admin/playbook/download")
+async def download_playbook(builtin: bool = False, kind: str = "") -> Response:
+    """The active playbook as a .md file. It is also the template: edit it and import it again. kind=prompts gives the prompt template."""
+    pb = playbook.prompt_template() if kind == "prompts" else playbook.default_playbook() if builtin else playbook.active()
+    return Response(playbook.to_markdown(pb), media_type="text/markdown", headers={"Content-Disposition": f'attachment; filename="playbook-{playbook.slug(pb["name"]) or "template"}.md"'})
+
+
+@app.post("/api/admin/playbook/check")
+async def check_playbook_file(body: PlaybookFile) -> dict:
+    """Read the file and report problems and sample messages. Nothing changes."""
+    return check_playbook(body.md)[1]
+
+
+class TryPlaybook(BaseModel):
+    md: str
+    profile: str = "Senior software engineer with 8 years of experience in Python, FastAPI, PostgreSQL and AWS. Built payment APIs and led a small team."
+    reply: str = ""
+
+
+@app.post("/api/admin/playbook/try")
+async def try_playbook(body: TryPlaybook) -> dict:
+    """Write message 1 (and a reply to a sample member answer) from a prompt playbook, without applying it and without sending anything."""
+    pb, report = check_playbook(body.md)
+    if not report["ok"]:
+        raise HTTPException(status_code=422, detail="The file has errors: " + " ".join(report["errors"][:3]))
+    if pb.get("mode") != "prompt":
+        raise HTTPException(status_code=400, detail="Try it works for prompt playbooks (with '## First message prompt' and '## Chat logic prompt'). The other format has fixed texts: see the sample messages.")
+    candidate = {"id": 0, "name": "Sample Member", "summary": body.profile[:3000], "stack": []}
+    try:
+        first = await prompted.first_message(candidate, prompts=pb["prompts"])
+        result = {"role": first["role"], "first_message": first["message"], "reply": None}
+        if body.reply.strip():
+            history = [{"direction": "outbound", "body": first["message"]}, {"direction": "inbound", "body": body.reply.strip()}]
+            decision = await prompted.decide(candidate, body.reply.strip(), history, 1, prompts=pb["prompts"], github_ready=True)
+            result["reply"] = decision
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"The AI could not write it: {exc}") from exc
+    return result
+
+
+@app.put("/api/admin/playbook")
+async def import_playbook(body: PlaybookFile) -> dict:
+    pb, report = check_playbook(body.md)
+    if not report["ok"]:
+        raise HTTPException(status_code=422, detail="The file has errors: " + " ".join(report["errors"][:3]))
+    playbook.save_active(body.md, body.filename[:120], pb)
+    return {**report, "status": playbook_status()}
+
+
+@app.delete("/api/admin/playbook")
+async def reset_playbook() -> dict:
+    playbook.reset_active()
+    return playbook_status()
+
+
+@app.get("/api/admin/overview")
+async def admin_overview() -> dict:
+    with connection() as conn:
+        accounts = conn.execute("SELECT id, label, paused, last_seen, created_at FROM accounts ORDER BY created_at").fetchall()
+    rows = [account_overview(a["id"], a["label"], bool(a["paused"]), a["last_seen"]) for a in accounts]
+    ledger_error = None
+    try:
+        ledger_ready = await SupabaseLedger().status_ready()
+    except Exception as exc:
+        ledger_ready, ledger_error = None, ledger_problem(exc) if settings.supabase_url and settings.supabase_key else None
+    totals = {"accounts": len(rows), "connected": sum(r["himalayas_authorized"] for r in rows), "paused": sum(r["paused"] for r in rows),
+              "automation_running": sum(1 for r in rows if r["automation"]["running"]), "members": sum(r["members"] for r in rows),
+              "unread": sum(r.get("unread", 0) for r in rows)}
+    for status in ("sent", "failed", "skipped"):
+        totals[status] = sum(r["by_status"].get(status, 0) for r in rows)
+    totals["queued"] = sum(r["by_status"].get(s, 0) for r in rows for s in ("queued", "scheduled", "approved"))
+    return {
+        "server": {"ok": True, "time": utc_now()}, "totals": totals, "accounts": rows,
+        "holds": [{"key": key, "reason": hold["reason"], "since": hold["since"]} for key, hold in holds.items()],
+        "checks": {"openrouter_key": bool(settings.openrouter_api_key), "supabase": bool(settings.supabase_url and settings.supabase_key) and not ledger_error, "supabase_error": ledger_error,
+                   "ledger_status_ready": ledger_ready, "github": settings_ready()},
+    }
+
+
+class PauseRequest(BaseModel):
+    paused: bool
+
+
+@app.post("/api/admin/accounts/{account_id}/pause")
+async def admin_pause(account_id: str, request: PauseRequest) -> dict:
+    with connection() as conn:
+        updated = conn.execute("UPDATE accounts SET paused=? WHERE id=?", (1 if request.paused else 0, account_id)).rowcount
+    if not updated:
+        raise HTTPException(status_code=404, detail="Account not found")
+    if not request.paused:
+        holds.pop(account_id, None)  # the person looked at the problem and chose to continue
+        holds.pop("first:" + account_id, None)
+        rejection_streak.pop(account_id, None)
+        next_first_message_at.pop(account_id, None)
+        next_reply_at.pop(account_id, None)
+    publish_dashboard_update("paused" if request.paused else "resumed", account_id)
+    return {"id": account_id, "paused": request.paused}
+
+
+class BulkRequest(BaseModel):
+    action: Literal["start_automation", "stop_automation", "pause", "resume"]
+    account_ids: list[str] | None = None  # every account when omitted
+
+
+@app.post("/api/admin/bulk")
+async def admin_bulk(request: BulkRequest) -> dict:
+    with connection() as conn:
+        known = [row["id"] for row in conn.execute("SELECT id FROM accounts ORDER BY created_at")]
+    targets = [a for a in (request.account_ids or known) if a in known]
+    results: dict[str, str] = {}
+    for account_id in targets:
+        if request.action == "start_automation":
+            if not oauth_status(account_id):
+                results[account_id] = "skipped: Himalayas login expired" if login_state(account_id) == "expired" else "skipped: Himalayas is not connected"
+            elif is_paused(account_id):
+                results[account_id] = "skipped: sending is paused"
+            else:
+                await start_automation(account_id)
+                results[account_id] = "started"
+        elif request.action == "stop_automation":
+            await stop_automation(account_id)
+            results[account_id] = "stopped"
+        else:
+            await admin_pause(account_id, PauseRequest(paused=request.action == "pause"))
+            results[account_id] = "paused" if request.action == "pause" else "resumed"
+    return {"action": request.action, "results": results}
+
+
+@app.get("/", include_in_schema=False)
+async def root() -> RedirectResponse:
+    return RedirectResponse("/admin/")
+
+
+# ---- Check the bot's chat histories against what Himalayas really holds ----
+
+verify_locks: dict[str, asyncio.Lock] = {}
+VERIFY_INTERVAL_SECONDS = 1200
+
+
+async def verify_with_himalayas(account_id: str, import_replies: bool = True) -> dict:
+    """Read every conversation straight from Himalayas and compare it with the bot's records.
+    It saves the result per member (message counts, read receipts), and imports a reply the bot has not recorded yet.
+    Nothing is sent and nothing is deleted."""
+    async with verify_locks.setdefault(account_id, asyncio.Lock()):
+        client = HimalayasMCP(account_id)
+        rooms = await client.rooms_by_slug()
+        with connection() as conn:
+            candidates = conn.execute("SELECT * FROM candidates WHERE account_id=?", (account_id,)).fetchall()
+            messages = conn.execute("SELECT candidate_id, direction, status, body, COALESCE(sent_at, created_at) AS at FROM messages WHERE account_id=? AND status NOT IN ('failed', 'superseded', 'skipped', 'scheduled', 'approved', 'queued')", (account_id,)).fetchall()
+        # Messages from before the login switched to another Himalayas company live in that company's inbox, not in this one.
+        # They are not expected here, and their earlier check results stay as they were.
+        cutoff = company_switch_time(account_id)
+        if cutoff:
+            messages = [m for m in messages if (m["at"] or "") >= cutoff]
+        by_candidate: dict[int, list] = {}
+        for message in messages:
+            by_candidate.setdefault(message["candidate_id"], []).append(message)
+        targets = [c for c in candidates if c["external_id"] in rooms or by_candidate.get(c["id"])]
+        gate = asyncio.Semaphore(4)
+        summary = {"conversations_on_himalayas": len(rooms), "checked": 0, "match": 0, "mismatch": [], "missing_on_himalayas": [], "replies_imported": 0, "not_in_bot": [r["name"] for slug, r in rooms.items() if slug not in {c["external_id"] for c in candidates}]}
+
+        async def check(candidate) -> None:
+            slug = candidate["external_id"]
+            mine = by_candidate.get(candidate["id"], [])
+            room = rooms.get(slug, {}).get("room")
+            note, thread = "", {"count": 0, "messages": []}
+            if room:
+                async with gate:
+                    for attempt in range(2):
+                        try:
+                            thread = await client.get_thread(room)
+                            note = ""
+                            break
+                        except Exception as exc:
+                            note = f"could not read: {type(exc).__name__} {str(exc)[:80]}"
+                            await asyncio.sleep(2)
+            elif any(m["direction"] == "outbound" and m["status"] == "sent" for m in mine):
+                note = "no conversation on Himalayas"
+            company_text = " ".join(letters_only(m["body"]) for m in thread["messages"] if m["who"] == "company")
+            missing = [m for m in mine if m["direction"] == "outbound" and m["status"] == "sent" and letters_only(m["body"])[:40] not in company_text]
+            known_replies = {letters_only(m["body"])[:40] for m in mine if m["direction"] == "inbound"}
+            new_replies = [m for m in thread["messages"] if m["who"] == "member" and letters_only(m["body"])[:40] not in known_replies]
+            if import_replies:
+                for reply in reversed(new_replies):  # oldest first
+                    if await respond_to_inbound(account_id, candidate, reply["body"], hashlib.sha256(f"{room}\n{reply['body']}".encode()).hexdigest(), utc_now()):
+                        summary["replies_imported"] += 1
+            matches = bool(room) and not missing and (not new_replies or import_replies) and not note
+            with connection() as conn:
+                conn.execute(
+                    "INSERT INTO himalayas_check (candidate_id, account_id, checked_at, room, total, ours, theirs, ours_read, last_when, matches, note) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(candidate_id) DO UPDATE SET checked_at=excluded.checked_at, room=excluded.room, total=excluded.total, ours=excluded.ours, theirs=excluded.theirs, "
+                    "ours_read=excluded.ours_read, last_when=excluded.last_when, matches=excluded.matches, note=excluded.note",
+                    (candidate["id"], account_id, utc_now(), room, len(thread["messages"]), sum(m["who"] == "company" for m in thread["messages"]), sum(m["who"] == "member" for m in thread["messages"]),
+                     sum(m["read"] for m in thread["messages"] if m["who"] == "company"), thread["messages"][0]["when"] if thread["messages"] else None, 1 if matches else 0, note or ("; ".join(f"{len(x)} not on Himalayas" for x in (missing,) if x)) or None),
+                )
+            summary["checked"] += 1
+            if matches:
+                summary["match"] += 1
+            else:
+                summary["mismatch"].append(candidate["name"])
+            if missing:
+                summary["missing_on_himalayas"].append(candidate["name"])
+
+        await asyncio.gather(*(check(candidate) for candidate in targets))
+    publish_dashboard_update("verified", account_id)
+    return summary
+
+
+@app.post("/api/db/verify-himalayas")
+async def verify_himalayas(account: Account, import_replies: bool = True) -> dict:
+    if not oauth_status(account):
+        raise HTTPException(status_code=409, detail="Himalayas is not connected for this account")
+    try:
+        return await verify_with_himalayas(account, import_replies)
+    except (MCPError, LoginExpired) as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/api/conversations/{candidate_id}/himalayas")
+async def conversation_on_himalayas(candidate_id: int, account: Account) -> dict:
+    """The member's conversation exactly as Himalayas holds it right now (newest message first)."""
+    with connection() as conn:
+        candidate = conn.execute("SELECT id, name, external_id, profile_url FROM candidates WHERE id=? AND account_id=?", (candidate_id, account)).fetchone()
+    if not candidate:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+    client = HimalayasMCP(account)
+    try:
+        room = (await client.rooms_by_slug()).get(candidate["external_id"], {}).get("room")
+        thread = await client.get_thread(room) if room else {"count": 0, "room": None, "messages": []}
+    except (MCPError, LoginExpired) as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {**thread, "profile_url": candidate["profile_url"], "name": candidate["name"]}
+
+
+async def himalayas_check_loop() -> None:
+    """A safety net: every 20 minutes, compare with Himalayas and import a reply that the normal monitor did not see."""
+    await asyncio.sleep(120)
+    while True:
+        for account_id in authorized_accounts():
+            try:
+                await verify_with_himalayas(account_id, import_replies=True)
+            except Exception as exc:
+                print(f"Himalayas check failed for {account_id}: {exc}")
+        await asyncio.sleep(VERIFY_INTERVAL_SECONDS)
 
 
 # ---- Database cleanup (this account only) ----
@@ -749,6 +1546,70 @@ async def db_clean(request: CleanRequest, account: Account) -> dict:
     return {"dry_run": False, **summary, "backup": backup}
 
 
+# Errors that happen BEFORE anything is sent (ledger check, login). Retrying these cannot send a message twice.
+NOT_SENT_ERRORS = (
+    "Ledger schema check failed", "Contact lookup failed", "SUPABASE_URL and SUPABASE_KEY are not configured",
+    "Himalayas login expired", "Himalayas authorization required", "Himalayas access token expired",
+    "Himalayas rejected", "Himalayas did not return a conversation", "Himalayas cannot reopen", "Not delivered:",
+)
+
+
+class RetryFailedRequest(BaseModel):
+    dry_run: bool = True
+    include_unavailable: bool = False  # also retry members whose conversation Himalayas cannot reopen (pointless until that is fixed)
+    rewrite: bool = False  # write the first messages again in the current short, neutral style before queueing them
+
+
+@app.post("/api/db/retry-failed")
+async def retry_failed(request: RetryFailedRequest, account: Account) -> dict:
+    """Queue again every failed message that never left because of a ledger, login, or Himalayas refusal.
+    With rewrite, first messages that were not delivered (failed or still queued) get new text first, because a message that
+    Himalayas refused as spam would be refused again. Messages that failed after a send was attempted are left alone."""
+    with connection() as conn:
+        failed = conn.execute("SELECT id, candidate_id, stage, error FROM messages WHERE account_id=? AND direction='outbound' AND status='failed' ORDER BY created_at, id", (account,)).fetchall()
+        waiting = conn.execute("SELECT id, candidate_id, stage FROM messages WHERE account_id=? AND direction='outbound' AND status IN ('scheduled', 'approved') AND stage='first_sent' AND " + TRUE_FIRST_SQL + " ORDER BY created_at, id", (account,)).fetchall() if request.rewrite else []
+        answered = {row["candidate_id"] for row in conn.execute("SELECT DISTINCT candidate_id FROM messages WHERE account_id=? AND direction='outbound' AND status='sent'", (account,))}
+    with connection() as conn:
+        # A failed message that already has a newer message for the same member (queued, sent, or skipped) must not be queued again.
+        replaced = {row["candidate_id"] for row in conn.execute("SELECT DISTINCT candidate_id FROM messages WHERE account_id=? AND direction='outbound' AND stage='first_sent' AND status IN ('scheduled', 'approved', 'sent', 'skipped')", (account,))}
+    unavailable = [row for row in failed if "Himalayas cannot reopen" in (row["error"] or "")]
+    safe = [row for row in failed if row["candidate_id"] not in replaced and any(pattern in (row["error"] or "") for pattern in NOT_SENT_ERRORS)
+            and (request.include_unavailable or "Himalayas cannot reopen" not in (row["error"] or ""))]
+    # Only a member's real first message is rewritten. A message to a member who already got one (an answer or introduction) is not.
+    to_rewrite = [row for row in [*safe, *waiting] if row["stage"] == "first_sent" and row["candidate_id"] not in answered] if request.rewrite else []
+    result = {"dry_run": request.dry_run, "safe": len(safe), "other": sum(1 for row in failed if row["candidate_id"] not in replaced and row not in safe and row not in unavailable), "unavailable": len(unavailable), "waiting": len(waiting), "rewrite": len(to_rewrite), "retried": 0, "rewritten": 0}
+    if request.dry_run or not (safe or waiting):
+        return result
+    bodies: dict[int, str] = {}
+    if to_rewrite:
+        gate = asyncio.Semaphore(settings.message_generation_concurrency)
+        recent = recent_first_messages(account)
+
+        async def rewrite(row) -> None:
+            with connection() as conn:
+                candidate = conn.execute("SELECT * FROM candidates WHERE id=?", (row["candidate_id"],)).fetchone()
+            item = parse_candidate(candidate)
+            async with gate:
+                fresh = await write_first_message(item, fixed_role=candidate["suggested_role"] or None, recent=list(recent))
+                recent.insert(0, fresh["message"])
+            bodies[row["id"]] = fresh["message"]
+
+        try:
+            await asyncio.gather(*(rewrite(row) for row in to_rewrite))
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Could not rewrite the messages: {exc}") from exc
+    queue = [*safe, *waiting]
+    with connection() as conn:
+        when = (datetime.now(timezone.utc) + timedelta(seconds=5)).isoformat()  # due now. The sender keeps the normal gap between messages.
+        for row in queue:
+            if row["id"] in bodies:
+                conn.execute("UPDATE messages SET body=?, status='scheduled', error=NULL, send_after=? WHERE id=?", (bodies[row["id"]], when, row["id"]))
+            else:
+                conn.execute("UPDATE messages SET status='scheduled', error=NULL, send_after=? WHERE id=?", (when, row["id"]))
+    publish_dashboard_update("messages_scheduled", account)
+    return {**result, "retried": len(safe), "rewritten": len(bodies)}
+
+
 @app.post("/api/messages/{message_id}/retry")
 async def retry_message(message_id: int, account: Account) -> dict:
     send_after = (datetime.now(timezone.utc) + timedelta(seconds=5)).isoformat()
@@ -767,9 +1628,105 @@ async def retry_message(message_id: int, account: Account) -> dict:
             (message_id,),
         ).fetchone()
     if row and message_id == await first_outbound_message_id(row["candidate_id"]):
-        await note_ledger(account, ledger_candidate(row), "queued", message_id, row["body"])
+        if await note_ledger(account, ledger_candidate(row), "queued", message_id, row["body"]) is False:
+            with connection() as conn:
+                conn.execute(
+                    "UPDATE messages SET status='skipped', error=? WHERE id=?",
+                    ("Already claimed by another profile (shared contact ledger)", message_id),
+                )
+            return {"retried": False, "skipped": True, "reason": "Already claimed by another profile"}
     publish_dashboard_update("messages_scheduled", account)
     return {"retried": True}
+
+
+@app.get("/api/admin/diagnose")
+async def diagnose(account: Account, probe: str = "") -> dict:
+    """Read-only checks of what Himalayas answers right now. Nothing is created and nothing is sent."""
+    client = HimalayasMCP(account)
+    report: dict = {}
+    async def attempt(name: str, action) -> None:
+        try:
+            report[name] = await action()
+        except Exception as exc:
+            report[name] = {"error": f"{type(exc).__name__}: {str(exc)[:300]}"}
+    async def tools():
+        reply = await client.rpc("tools/list")
+        listed = (reply.get("result") or {}).get("tools", [])
+        return {"http": reply.get("http"), "tools": {t["name"]: sorted((t.get("inputSchema") or {}).get("properties", {})) for t in listed}, "error": reply.get("error")}
+    await attempt("tools", tools)
+    async def search():
+        result = await client.call("search_talent", {"page": 1, "sort": "recent"})
+        return {"ok": True, "chars": len(result_text(result))}
+    await attempt("search_talent", search)
+    async def conversations():
+        result = await client.call("list_conversations", {})
+        return {"ok": True, "text": result_text(result)[:200]}
+    await attempt("list_conversations", conversations)
+    async def my_profile():
+        return {"ok": True, "text": result_text(await client.call("get_my_profile", {}))[:500]}
+    if probe:  # opens an EMPTY conversation with this member (no message is sent). The room name shows which company the login acts as.
+        async def open_probe():
+            room = await client.open_room(probe)
+            return {"ok": True, "room": room}
+        await attempt("start_conversation", open_probe)
+    await attempt("get_my_profile", my_profile)
+    async def company_profile():
+        return {"ok": True, "text": result_text(await client.call("get_company_profile", {}))[:500]}
+    await attempt("get_company_profile", company_profile)
+    return report
+
+
+@app.post("/api/db/retry-replies")
+async def retry_replies(account: Account) -> dict:
+    """Write again, in different words, the follow-up messages that Himalayas refused, and queue them. Only members whose last message
+    is such a refused reply, and who have nothing waiting. A message that was refused is never sent again as it was."""
+    with connection() as conn:
+        rows = conn.execute(
+            """SELECT m.* FROM messages m WHERE m.account_id=? AND m.direction='outbound' AND m.status='failed' AND m.stage IS NOT NULL AND m.stage != 'closed'
+            AND EXISTS (SELECT 1 FROM messages s WHERE s.candidate_id=m.candidate_id AND s.direction='outbound' AND s.status='sent' AND s.id<m.id)
+            AND m.id=(SELECT MAX(x.id) FROM messages x WHERE x.candidate_id=m.candidate_id AND x.direction='outbound' AND x.status!='superseded')""",
+            (account,)).fetchall()
+    queued = 0
+    for row in rows:
+        if already_sent_this_step(row["candidate_id"], row["stage"], row["id"]):
+            continue  # a message for this step was delivered since, so this failed one is not owed any more
+        new_id = await (requeue_intro(row, account) if row["stage"] == "intro_sent" else requeue_rephrased(row, account))
+        queued += 1 if new_id else 0
+    if queued:
+        publish_dashboard_update("messages_scheduled", account)
+    return {"failed_replies": len(rows), "queued": queued}
+
+
+@app.post("/api/db/retry-unreachable")
+async def retry_unreachable(account: Account) -> dict:
+    """Queue again the first messages of members whose conversation Himalayas could not reopen.
+
+    That often happens when the conversation already exists for the company (another profile opened it,
+    or start_conversation created it but failed to return the room). After a fix that recovers existing
+    rooms, or after the login changes to another company, retrying is useful.
+    """
+    with connection() as conn:
+        ids = [row["id"] for row in conn.execute(
+            """SELECT m.id FROM messages m WHERE m.account_id=? AND m.direction='outbound' AND m.status='failed' AND m.error LIKE 'Himalayas cannot reopen%'
+            AND NOT EXISTS (SELECT 1 FROM messages x WHERE x.candidate_id=m.candidate_id AND x.direction='outbound' AND x.id>m.id AND x.status!='failed')""",
+            (account,))]
+    for message_id in ids:
+        await retry_message(message_id, account)
+    return {"requeued": len(ids)}
+
+
+@app.post("/api/db/retry-outage")
+async def retry_outage(account: Account) -> dict:
+    """Queue again the messages that failed only because Himalayas could not open the conversation (for example error 406).
+    Nothing was sent for them, and no filter refused them, so the same text is fine."""
+    with connection() as conn:
+        ids = [row["id"] for row in conn.execute(
+            """SELECT m.id FROM messages m WHERE m.account_id=? AND m.direction='outbound' AND m.status='failed' AND m.error LIKE '%Failed to start conversation%'
+            AND NOT EXISTS (SELECT 1 FROM messages x WHERE x.candidate_id=m.candidate_id AND x.direction='outbound' AND x.id>m.id AND x.status!='failed')""",
+            (account,))]
+    for message_id in ids:
+        await retry_message(message_id, account)
+    return {"requeued": len(ids)}
 
 
 @app.get("/api/events")
@@ -792,6 +1749,308 @@ async def events(account: Account) -> StreamingResponse:
     return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
+@app.get("/api/admin/events")
+async def admin_events() -> StreamingResponse:
+    """Live updates for the Control center across every profile (extension uses /api/events for one account)."""
+    queue: asyncio.Queue = asyncio.Queue(maxsize=50)
+    dashboard_subscribers[queue] = "*"
+
+    async def stream():
+        try:
+            yield "event: connected\ndata: {}\n\n"
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=25)
+                    yield f"event: dashboard-update\ndata: {json.dumps(event)}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+        finally:
+            dashboard_subscribers.pop(queue, None)
+
+    return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+# Gap between first messages, enforced when they are sent (not only when they are scheduled). After a pause, a restart, or a long
+# outage every queued message is overdue, and sending them back to back is what a spam filter looks for.
+next_first_message_at: dict[str, float] = {}
+
+
+def note_first_message_sent(account_id: str) -> None:
+    next_first_message_at[account_id] = time.monotonic() + first_message_gap()
+
+
+def cooling_accounts() -> list[str]:
+    now = time.monotonic()
+    return [account for account, until in next_first_message_at.items() if until > now]
+
+
+# Himalayas' spam filter refuses some messages at random: most refused members were accepted a moment later with different wording.
+# So a refusal never changes the pace. That member gets a different message and the bot carries on.
+# Only refusals of several DIFFERENT members in a row (no first message accepted in between) suggest a real block. Then FIRST messages
+# wait a few minutes and start again by themselves. Replies to members who already answered are never held back by this.
+REFUSED_MEMBERS_BEFORE_HOLD = 4
+FIRST_HOLD_SECONDS = 600
+# A refused message is rewritten in different wording and sent again AT ONCE, and again, until it is delivered. Nothing was sent, so no
+# gap is needed. The cap is a guard against an endless loop when the problem is the member and not the wording.
+MAX_REFUSALS_PER_MEMBER = 6
+RETRY_PAUSE_SECONDS = (1.0, 3.0)  # a moment between tries, only so that the tries are not simultaneous
+# If Himalayas has really blocked the account, retrying would burn through refusals within minutes. Many refusals in a short time
+# put FIRST messages on the same self-releasing hold. Ordinary retrying stays far below this.
+REFUSALS_PER_WINDOW = 15
+REFUSAL_WINDOW_SECONDS = 600
+refusal_times: dict[str, list[float]] = {}
+REPLY_GAP_SECONDS = (20, 60)  # replies to different members are also spaced a little
+rejection_streak: dict[str, list[int]] = {}  # the different members refused in a row, per account. A first message that is accepted resets it.
+next_reply_at: dict[str, float] = {}
+# A member's first message is one that has no sent message before it. (A member's answer can carry the stage "first_sent" too.)
+TRUE_FIRST_SQL = "NOT EXISTS (SELECT 1 FROM messages s WHERE s.candidate_id=messages.candidate_id AND s.direction='outbound' AND s.status='sent')"
+
+
+def day_start() -> datetime:
+    """The day for the daily limit is the UTC day. It starts at 00:00 UTC."""
+    return datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def first_messages_today(account_id: str) -> int:
+    """New members messaged today by this profile: first messages that were sent (replies are not counted)."""
+    with connection() as conn:
+        return conn.execute(
+            """SELECT COUNT(*) FROM messages m WHERE m.account_id=? AND m.direction='outbound' AND m.status='sent' AND m.sent_at >= ?
+            AND m.id=(SELECT MIN(x.id) FROM messages x WHERE x.candidate_id=m.candidate_id AND x.direction='outbound' AND x.status='sent')""",
+            (account_id, max(day_start().isoformat(), company_switch_time(account_id))),  # a company that has just been connected starts from zero
+        ).fetchone()[0]
+
+
+def daily_status(account_id: str) -> dict:
+    limit = settings.daily_dm_limit
+    sent = first_messages_today(account_id)
+    reset = day_start() + timedelta(days=1)
+    return {"limit": limit, "sent_today": sent, "remaining": max(0, limit - sent) if limit else None, "reached": bool(limit) and sent >= limit,
+            "resets_at": reset.isoformat(), "resets_in_seconds": int((reset - datetime.now(timezone.utc)).total_seconds())}
+
+
+def daily_limit_reason(status: dict) -> str:
+    return f"Daily limit reached: {status['sent_today']} of {status['limit']} new members messaged today. Sending resumes at 00:00 UTC"
+
+
+def capped_accounts() -> list[str]:
+    """Profiles that have reached the daily limit. Their first messages wait until tomorrow. Replies are not affected."""
+    if not settings.daily_dm_limit:
+        return []
+    with connection() as conn:
+        accounts = [row["id"] for row in conn.execute("SELECT id FROM accounts")]
+    return [account for account in accounts if daily_status(account)["reached"]]
+
+
+def already_sent_this_step(candidate_id: int, stage: str | None, exclude_id: int | None = None) -> bool:
+    """True when a message for this step was already DELIVERED to the member, and the member has not written since.
+    The conversation goes one message at a time: the member answers, then we answer. A second message for the same step is a duplicate.
+    It happens when several rewritten copies of one message are waiting, and one of them was accepted."""
+    with connection() as conn:
+        return conn.execute(
+            """SELECT 1 FROM messages x WHERE x.candidate_id=? AND x.direction='outbound' AND x.status='sent' AND COALESCE(x.stage, 'first_sent')=? AND x.id!=?
+            AND COALESCE(x.sent_at, x.created_at) > COALESCE((SELECT MAX(i.created_at) FROM messages i WHERE i.candidate_id=? AND i.direction='inbound'), '') LIMIT 1""",
+            (candidate_id, stage or "first_sent", exclude_id or 0, candidate_id),
+        ).fetchone() is not None
+
+
+def company_switch_time(account_id: str) -> str:
+    """When the Himalayas login last changed to another company (ISO time), or an empty string."""
+    try:
+        return json.loads(get_state(f"himalayas_company_change:{account_id}") or "{}").get("at", "")
+    except ValueError:
+        return ""
+
+
+def first_message_gap() -> float:
+    """Seconds to wait between first messages: a random value between the configured minimum and maximum."""
+    low = settings.min_message_delay_seconds
+    return random.uniform(low, max(low, settings.max_message_delay_seconds))
+
+
+def recent_first_messages(account_id: str, limit: int = 15) -> list[str]:
+    """The newest first messages (sent or waiting). New messages are compared with these so that they do not all look alike."""
+    with connection() as conn:
+        rows = conn.execute(
+            "SELECT body FROM messages WHERE account_id=? AND direction='outbound' AND stage='first_sent' AND status IN ('sent', 'scheduled', 'approved') ORDER BY id DESC LIMIT ?",
+            (account_id, limit),
+        ).fetchall()
+    return [row["body"] for row in rows]
+HOLD_SECONDS = 60
+holds: dict[str, dict] = {}  # "ledger" for the shared contact ledger, or an account id for its Himalayas login
+
+
+def set_hold(key: str, reason: str) -> None:
+    since = holds.get(key, {}).get("since") or utc_now()
+    holds[key] = {"reason": reason, "since": since, "until": time.monotonic() + HOLD_SECONDS}
+
+
+def hold_active(key: str) -> bool:
+    hold = holds.get(key)
+    if not hold:
+        return False
+    if time.monotonic() < hold["until"]:
+        return True
+    if key.startswith("first:"):  # a hold on first messages ends by itself, and the count of refusals starts again
+        holds.pop(key, None)
+        rejection_streak.pop(key[len("first:"):], None)
+    return False
+
+
+def hold_reason(account_id: str) -> str | None:
+    hold_active("first:" + account_id)  # clears the hold if it has run out
+    hold = holds.get("ledger") or holds.get(account_id) or holds.get("first:" + account_id)
+    return hold["reason"] if hold else None
+
+
+def hold_first_messages(account_id: str, reason: str) -> None:
+    """Hold FIRST messages for a few minutes. Replies to members who answered keep going. It ends by itself."""
+    holds["first:" + account_id] = {
+        "reason": f"Himalayas refused {REFUSED_MEMBERS_BEFORE_HOLD} different members in a row, so first messages wait {FIRST_HOLD_SECONDS // 60} minutes. Replies keep going. {reason[:160]}",
+        "since": utc_now(), "until": time.monotonic() + FIRST_HOLD_SECONDS,
+    }
+    publish_dashboard_update("paused", account_id)
+
+
+def refusals_for_member(candidate_id: int) -> int:
+    """Refusals in the current run of tries: those after the member's last accepted message. An accepted message starts the count again."""
+    with connection() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE candidate_id=? AND direction='outbound' AND status='failed' AND error LIKE 'Himalayas rejected%' "
+            "AND id > COALESCE((SELECT MAX(id) FROM messages WHERE candidate_id=? AND direction='outbound' AND status='sent'), 0)",
+            (candidate_id, candidate_id),
+        ).fetchone()[0]
+
+
+INTRO_REFUSALS_BEFORE_NEXT_LEVEL = 3
+
+
+def intro_level() -> int:
+    return int(get_state("intro_level", "1"))
+
+
+def note_intro_result(level: int, refused: bool) -> None:
+    """Learn which wording of the company introduction Himalayas accepts. Three refusals in a row at a level move everyone up a level.
+    An accepted introduction starts the count again. (Refusals are partly random, so two in a row is not enough to give up the website.)"""
+    key = f"intro_refusals_level_{level}"
+    if not refused:
+        set_state(key, "0")
+        return
+    count = int(get_state(key, "0")) + 1
+    set_state(key, str(count))
+    if count >= INTRO_REFUSALS_BEFORE_NEXT_LEVEL and level < chat.ai.INTRO_LEVELS and intro_level() <= level:
+        set_state("intro_level", str(level + 1))
+        set_state(key, "0")
+        upgrade_pending_intros()
+
+
+def upgrade_pending_intros() -> int:
+    """Introductions that are still waiting are written again at the current level, so none goes out in wording that is known to fail."""
+    level = intro_level()
+    changed = 0
+    with connection() as conn:
+        rows = conn.execute("SELECT m.id, m.candidate_id FROM messages m WHERE m.direction='outbound' AND m.stage='intro_sent' AND m.status IN ('scheduled', 'approved') AND COALESCE(m.variant, 0) < ?", (level,)).fetchall()
+        for row in rows:
+            candidate = conn.execute("SELECT * FROM candidates WHERE id=?", (row["candidate_id"],)).fetchone()
+            text = chat.ai.intro_message(parse_candidate(candidate), candidate["suggested_role"] or chat.ai.default_role(True), level)
+            conn.execute("UPDATE messages SET body=?, variant=? WHERE id=?", (text, level, row["id"]))
+            changed += 1
+    return changed
+
+
+async def requeue_intro(row, account_id: str) -> int | None:
+    """A member answered, and Himalayas refused our company introduction. Write it again and queue it. Best effort.
+    The first retry keeps the level (one refusal can be chance). After that it moves up a level."""
+    try:
+        with connection() as conn:
+            candidate = conn.execute("SELECT * FROM candidates WHERE id=?", (row["candidate_id"],)).fetchone()
+        used = row["variant"] or 0
+        level = max(intro_level(), used if refusals_for_member(row["candidate_id"]) <= 1 else min(used + 1, chat.ai.INTRO_LEVELS))
+        if already_sent_this_step(row["candidate_id"], "intro_sent"):
+            return None
+        text = await chat.ai.write_intro(parse_candidate(candidate), candidate["suggested_role"] or chat.ai.default_role(True), level)
+        with connection() as conn:
+            return conn.execute(
+                "INSERT INTO messages (account_id, candidate_id, direction, body, status, send_after, stage, variant, created_at) VALUES (?, ?, 'outbound', ?, 'scheduled', ?, 'intro_sent', ?, ?)",
+                (account_id, row["candidate_id"], text, utc_now(), level, utc_now()),
+            ).lastrowid
+    except Exception as exc:
+        print(f"Could not write the introduction again after a refusal: {exc}")
+        return None
+
+
+async def requeue_rephrased(row, account_id: str) -> int | None:
+    """Any other reply (process overview, assessment, answer, invitation) that Himalayas refused: the same facts in different words."""
+    try:
+        with connection() as conn:
+            candidate = conn.execute("SELECT * FROM candidates WHERE id=?", (row["candidate_id"],)).fetchone()
+        if already_sent_this_step(row["candidate_id"], row["stage"]):
+            return None
+        text = await chat.ai.rephrase_reply(row["body"], chat.ai.greeting_name(candidate["name"]))
+        if not text:
+            return None
+        with connection() as conn:
+            return conn.execute(
+                "INSERT INTO messages (account_id, candidate_id, direction, body, status, send_after, stage, variant, created_at) VALUES (?, ?, 'outbound', ?, 'scheduled', ?, ?, ?, ?)",
+                (account_id, row["candidate_id"], text, utc_now(), row["stage"], row["variant"], utc_now()),
+            ).lastrowid
+    except Exception as exc:
+        print(f"Could not rephrase a refused reply: {exc}")
+        return None
+
+
+async def requeue_rewritten(row, account_id: str) -> int | None:
+    """After a spam refusal, write that member a different first message. It is due at once. Best effort."""
+    try:
+        with connection() as conn:
+            candidate = conn.execute("SELECT * FROM candidates WHERE id=?", (row["candidate_id"],)).fetchone()
+        if already_sent_this_step(row["candidate_id"], "first_sent"):
+            return None
+        fresh = await write_first_message(parse_candidate(candidate), fixed_role=candidate["suggested_role"] or None, recent=[row["body"], *recent_first_messages(account_id)])
+        with connection() as conn:
+            new_id = conn.execute(
+                "INSERT INTO messages (account_id, candidate_id, direction, body, status, send_after, stage, created_at) VALUES (?, ?, 'outbound', ?, 'scheduled', ?, 'first_sent', ?)",
+                (account_id, row["candidate_id"], fresh["message"], utc_now(), utc_now()),
+            ).lastrowid
+        if await note_ledger(account_id, ledger_candidate(row), "queued", new_id, fresh["message"]) is False:
+            with connection() as conn:
+                conn.execute(
+                    "UPDATE messages SET status='skipped', error=? WHERE id=?",
+                    ("Already claimed by another profile (shared contact ledger)", new_id),
+                )
+            return None
+        return new_id
+    except Exception as exc:
+        print(f"Could not write a new message after a refusal: {exc}")
+        return None
+
+
+def ledger_problem(exc: Exception) -> str:
+    text = str(exc)
+    if "401" in text or "Invalid API key" in text or "403" in text:
+        return "Supabase rejected the key. Check the Supabase URL and key in Settings"
+    if "not configured" in text:
+        return "The Supabase URL and key are not set in Settings"
+    return f"The contact ledger is not available ({text.splitlines()[0][:100]})"
+
+
+OUTAGE_PAUSES = (60, 120, 240, 480, 900)  # seconds between tries while Himalayas does not open conversations. It grows, up to 15 minutes.
+OUTAGE_TRIES_BEFORE_MEMBER_FAILS = 6
+outage_step: dict[str, int] = {}  # account -> how many tries in a row failed this way
+held_by_outage: dict[int, int] = {}  # message id -> how many times it was held this way
+worked_since_held: set[int] = set()  # held messages that have seen Himalayas work for other members since. Only these can be a problem of their own
+
+
+def hold_message(message_id: int, account_id: str, reason: str, seconds: int = HOLD_SECONDS) -> str:
+    """Keep the message queued and try it again later. Nothing was sent, so nothing is lost and nothing is marked failed."""
+    later = (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
+    with connection() as conn:
+        conn.execute("UPDATE messages SET send_after=? WHERE id=?", (later, message_id))
+    delivery_state(account_id).update({"status": f"on hold: {reason}", "current_id": None, "current_name": None})
+    publish_dashboard_update("delivery_held", account_id)
+    return "held"
+
+
 async def deliver(message_id: int) -> str:
     with connection() as conn:
         row = conn.execute(
@@ -805,21 +2064,157 @@ async def deliver(message_id: int) -> str:
         return "failed"
     account_id = row["account_id"]
     state = delivery_state(account_id)
+    if already_sent_this_step(row["candidate_id"], row["stage"], message_id):
+        # Another copy of this message was already delivered to this member. Sending this one too would be a duplicate.
+        with connection() as conn:
+            conn.execute("UPDATE messages SET status='superseded', error='Not sent: this step was already delivered to the member' WHERE id=?", (message_id,))
+        state.update({"status": "idle", "current_id": None, "current_name": None})
+        publish_dashboard_update("message_skipped", account_id)
+        return "skipped"
+    if hold_active(account_id):  # this account's Himalayas login needs attention. Do not even try.
+        return hold_message(message_id, account_id, holds[account_id]["reason"])
     state["current_id"] = message_id
     state["status"] = "sending"
     publish_dashboard_update("message_sending", account_id)
     state["current_name"] = row["candidate_name"]
     first_contact = False
+    delivered = False  # becomes True once Himalayas has accepted the message
     try:
         first_contact = row["id"] == (await first_outbound_message_id(row["candidate_id"]))
-        ledger = SupabaseLedger()
-        if first_contact and await ledger.was_contacted(row["candidate_external_id"]):
+        ledger = None
+        if first_contact:
+            if hold_active("first:" + account_id):  # only FIRST messages wait. Replies to members who answered never do.
+                return hold_message(message_id, account_id, holds["first:" + account_id]["reason"])
+            if hold_active("ledger"):
+                return hold_message(message_id, account_id, holds["ledger"]["reason"])
+            today = daily_status(account_id)
+            if today["reached"]:  # also stops the immediate resend after a refusal from going past the limit
+                return hold_message(message_id, account_id, daily_limit_reason(today), min(3600, max(60, today["resets_in_seconds"])))
+            try:
+                ledger = SupabaseLedger()
+                already_contacted = await ledger.was_contacted(row["candidate_external_id"], account_id=account_id)
+            except SupabaseError as exc:
+                # The check that protects against messaging someone twice cannot run. Nothing was sent yet, so keep the
+                # message queued (not failed) and try again shortly. This also stops a bad key from failing the whole queue.
+                set_hold("ledger", ledger_problem(exc))
+                return hold_message(message_id, account_id, holds["ledger"]["reason"])
+            holds.pop("ledger", None)
+            if already_contacted:
+                with connection() as conn:
+                    conn.execute(
+                        "UPDATE messages SET status='skipped', error=? WHERE id=?",
+                        ("Already contacted or claimed by another profile (shared contact ledger)", message_id),
+                    )
+                state["status"] = "skipped"
+                publish_dashboard_update("message_skipped", account_id)
+                return "skipped"
+        try:
+            await HimalayasMCP(account_id).send_message(row["candidate_external_id"], row["body"], first_contact=first_contact)
+        except LoginExpired as exc:
+            set_hold(account_id, str(exc))
+            return hold_message(message_id, account_id, str(exc))
+        except AlreadyMessaged:
+            # Someone already wrote to this member on Himalayas (for example by hand). Do not write again.
             with connection() as conn:
-                conn.execute("UPDATE messages SET status='skipped', error='Already contacted (shared contact ledger)' WHERE id=?", (message_id,))
-            state["status"] = "skipped"
+                conn.execute("UPDATE messages SET status='skipped', error='Already messaged on Himalayas (contacted before, for example by hand)' WHERE id=?", (message_id,))
+            if first_contact and ledger is not None:
+                try:
+                    await ledger.record_contact({**ledger_candidate(row), "sent_at": utc_now(), "account_id": account_id, "account_label": account_label(account_id)}, message_id, row["body"])
+                except SupabaseError as exc:
+                    print(f"Could not record the existing contact in the ledger: {exc}")
+            state.update({"status": "skipped", "current_id": None, "current_name": None})
             publish_dashboard_update("message_skipped", account_id)
             return "skipped"
-        await HimalayasMCP(account_id).send_message(row["candidate_external_id"], row["body"], first_contact=first_contact)
+        except ConversationUnavailable as exc:
+            # A problem with this one member on Himalayas' side. It is not a spam refusal, so it does not count as a strike and
+            # does not pause the account. The other members go on.
+            with connection() as conn:
+                conn.execute("UPDATE messages SET status='failed', error=? WHERE id=?", (str(exc), message_id))
+            state.update({"status": "failed", "current_id": None, "current_name": None})
+            if first_contact:
+                await note_ledger(account_id, ledger_candidate(row), "failed", message_id, row["body"], str(exc))
+            return "failed"
+        except HimalayasUnavailable as exc:
+            # Himalayas could not open the conversation and blames no message. If it happens again and again it is Himalayas or the
+            # account, not the member, so the message is NOT failed. It stays queued and is tried again after a pause that grows.
+            tries = held_by_outage[message_id] = held_by_outage.get(message_id, 0) + 1
+            if tries > OUTAGE_TRIES_BEFORE_MEMBER_FAILS and message_id in worked_since_held:  # other members went through in between, so this member really cannot be opened
+                with connection() as conn:
+                    conn.execute("UPDATE messages SET status='failed', error=? WHERE id=?", (str(exc), message_id))
+                state.update({"status": "failed", "current_id": None, "current_name": None})
+                held_by_outage.pop(message_id, None)
+                worked_since_held.discard(message_id)
+                if first_contact:
+                    await note_ledger(account_id, ledger_candidate(row), "failed", message_id, row["body"], str(exc))
+                return "failed"
+            step = outage_step.get(account_id, 0)
+            outage_step[account_id] = step + 1
+            pause = OUTAGE_PAUSES[min(step, len(OUTAGE_PAUSES) - 1)]
+            reason = (f"Himalayas is not opening conversations right now ({str(exc)[:90]}). Messages stay queued and nothing is marked failed. "
+                      f"The next try is in {pause // 60} min. If this lasts, reconnect Himalayas or check messaging for the company on Himalayas.")
+            if first_contact:
+                holds["first:" + account_id] = {"reason": reason, "since": holds.get("first:" + account_id, {}).get("since") or utc_now(), "until": time.monotonic() + pause}
+            publish_dashboard_update("paused", account_id)
+            return hold_message(message_id, account_id, reason, pause)
+        except HimalayasRejected as exc:
+            # Himalayas refused it, so it was not delivered. Mark it failed with the real reason. If this keeps happening the
+            # problem is with the account, not the message, so stop sending instead of failing the whole queue.
+            with connection() as conn:
+                conn.execute("UPDATE messages SET status='failed', error=? WHERE id=?", (str(exc), message_id))
+            state.update({"status": "failed", "current_id": None, "current_name": None})
+            if first_contact:
+                await note_ledger(account_id, ledger_candidate(row), "failed", message_id, row["body"], str(exc))
+            spam_refusal = any(word in str(exc).lower() for word in ("filter", "spam"))
+            refused = refusals_for_member(row["candidate_id"])
+            if first_contact:
+                # Count DIFFERENT members refused in a row. The same member refused again is not a sign of a block.
+                streak = rejection_streak.setdefault(account_id, [])
+                if row["candidate_id"] not in streak:
+                    streak.append(row["candidate_id"])
+                if len(streak) >= REFUSED_MEMBERS_BEFORE_HOLD:
+                    hold_first_messages(account_id, str(exc))
+            if spam_refusal:
+                now = time.monotonic()
+                recent = [t for t in refusal_times.get(account_id, []) if now - t < REFUSAL_WINDOW_SECONDS] + [now]
+                refusal_times[account_id] = recent
+                if first_contact and len(recent) >= REFUSALS_PER_WINDOW and not hold_active("first:" + account_id):
+                    holds["first:" + account_id] = {
+                        "reason": f"Himalayas refused {len(recent)} messages in {REFUSAL_WINDOW_SECONDS // 60} minutes, so first messages wait {FIRST_HOLD_SECONDS // 60} minutes. Replies keep going. {str(exc)[:120]}",
+                        "since": utc_now(), "until": time.monotonic() + FIRST_HOLD_SECONDS,
+                    }
+                    publish_dashboard_update("paused", account_id)
+            on_hold = hold_active("first:" + account_id) if first_contact else False
+            if spam_refusal:
+                if row["stage"] == "intro_sent":
+                    note_intro_result(row["variant"] or 0, True)
+                if refused >= MAX_REFUSALS_PER_MEMBER:
+                    with connection() as conn:
+                        conn.execute("UPDATE messages SET error=? WHERE id=?", (f"Gave up: Himalayas refused {refused} different messages to this member. {exc}", message_id))
+                else:
+                    # Write it again in a different style and send it AT ONCE. Repeat until it is delivered (or the cap above).
+                    if first_contact and row["stage"] in (None, "first_sent"):
+                        new_id = await requeue_rewritten(row, account_id)
+                    elif row["stage"] == "intro_sent":
+                        new_id = await requeue_intro(row, account_id)  # the member answered, so this conversation matters most
+                    else:
+                        new_id = await requeue_rephrased(row, account_id)
+                    if new_id and not on_hold:  # during a hold the new message waits in the queue and goes when the hold ends
+                        await asyncio.sleep(random.uniform(*RETRY_PAUSE_SECONDS))
+                        return await deliver(new_id)
+            return "failed"
+        delivered = True
+        outage_step.pop(account_id, None)  # Himalayas opens conversations again
+        worked_since_held.update(held_by_outage)
+        held_by_outage.pop(message_id, None)
+        worked_since_held.discard(message_id)
+        if first_contact:
+            rejection_streak.pop(account_id, None)  # a first message was accepted, so refusals in a row start again from zero
+            note_first_message_sent(account_id)
+        else:
+            next_reply_at[account_id] = time.monotonic() + random.uniform(*REPLY_GAP_SECONDS)
+            if row["stage"] == "intro_sent":
+                note_intro_result(row["variant"] or 0, False)
+        holds.pop(account_id, None)
         candidate = {
             "external_id": row["candidate_external_id"],
             "name": row["candidate_name"],
@@ -831,6 +2226,12 @@ async def deliver(message_id: int) -> str:
         candidate["sent_at"] = utc_now()
         with connection() as conn:
             conn.execute("UPDATE messages SET status='sent', sent_at=? WHERE id=?", (candidate["sent_at"], message_id))
+            # The step is done. Other copies of it that are still waiting (rewrites made while this one was refused) must never go out.
+            conn.execute(
+                "UPDATE messages SET status='superseded', error='Not sent: this step was already delivered to the member' "
+                "WHERE candidate_id=? AND direction='outbound' AND status IN ('scheduled', 'approved') AND COALESCE(stage, 'first_sent')=? AND id!=?",
+                (row["candidate_id"], row["stage"] or "first_sent", message_id),
+            )
         if first_contact:
             try:
                 await ledger.record_contact(candidate, message_id, row["body"])
@@ -838,6 +2239,13 @@ async def deliver(message_id: int) -> str:
                 with connection() as conn:
                     conn.execute("UPDATE messages SET error=? WHERE id=?", (f"Sent, but contact ledger failed: {exc}", message_id))
     except (SupabaseError, MCPError, Exception) as exc:
+        if delivered:
+            # The message left. Something after it went wrong (bookkeeping). It must never be shown as failed,
+            # because someone could retry it and send it twice.
+            with connection() as conn:
+                conn.execute("UPDATE messages SET status='sent', sent_at=COALESCE(sent_at, ?), error=? WHERE id=?", (utc_now(), f"Sent, but a follow-up step failed: {exc}", message_id))
+            state.update({"status": "sent", "current_id": None, "current_name": None})
+            return "sent"
         with connection() as conn:
             conn.execute("UPDATE messages SET status='failed', error=? WHERE id=?", (str(exc), message_id))
         state.update({"status": "failed", "current_id": None, "current_name": None})
@@ -929,8 +2337,8 @@ async def respond_to_inbound(account_id: str, candidate_row, body: str, external
             return True
         with connection() as conn:
             conn.execute(
-                "INSERT INTO messages (account_id, candidate_id, direction, body, status, send_after, stage, created_at) VALUES (?, ?, 'outbound', ?, 'scheduled', ?, ?, ?)",
-                (account_id, candidate_id, plan["body"], chat.reply_time(), plan["stage"], utc_now()),
+                "INSERT INTO messages (account_id, candidate_id, direction, body, status, send_after, stage, variant, created_at) VALUES (?, ?, 'outbound', ?, 'scheduled', ?, ?, ?, ?)",
+                (account_id, candidate_id, plan["body"], chat.reply_time(), plan["stage"], plan.get("variant"), utc_now()),
             )
         if plan.get("invited"):
             publish_dashboard_update("github_invited", account_id)
@@ -984,6 +2392,10 @@ async def poll_replies(account_id: str, semaphore: asyncio.Semaphore) -> None:
         state["status"] = f"monitoring · {detected} new" if not failures else f"monitoring · {failures} failed"
         if detected:
             publish_dashboard_update("reply_received", account_id)
+    except HimalayasRejected as exc:
+        # Himalayas itself is not answering (for example a 404 while it blocks the account). It is not a fault of the bot, and the
+        # next poll tries again. It is shown as waiting, not as an error.
+        state["status"] = f"waiting for Himalayas: {str(exc).replace('Himalayas rejected ', '')[:110]}"
     except Exception as exc:
         state["status"] = f"failed: {exc}"
 
@@ -1022,6 +2434,12 @@ async def reply_monitor_loop() -> None:
             await retry_invitations()
         except Exception as exc:
             print(f"Invitation retry failed: {exc}")
+        polled = set(authorized_accounts())
+        with connection() as conn:
+            everyone = [row["id"] for row in conn.execute("SELECT id FROM accounts")]
+        for account_id in everyone:
+            if account_id not in polled:  # no working Himalayas login, so there is nothing to read
+                reply_monitor_state(account_id).update(running=False, status="waiting for a Himalayas login")
         # One failing account never blocks the others.
         await asyncio.gather(*(poll_replies(account_id, semaphore) for account_id in authorized_accounts()))
         await asyncio.sleep(settings.reply_poll_interval_seconds)
@@ -1031,14 +2449,37 @@ async def delivery_loop() -> None:
     # A single sequential loop serves every account, so the shared "already contacted" check
     # and the send that follows it can never interleave between two accounts.
     while True:
-        query = "SELECT id FROM messages WHERE status='scheduled' AND send_after <= ?"
+        # Accounts that are paused in the admin dashboard send nothing. Their queue waits.
+        query = "SELECT id FROM messages WHERE account_id NOT IN (SELECT id FROM accounts WHERE paused=1) AND ((status='scheduled' AND send_after <= ?)"
         params: list[str] = [utc_now()]
         if settings.auto_send:
             query += " OR (status='approved' AND send_after <= ?)"
             params.append(utc_now())
-        query += " ORDER BY send_after LIMIT 1"
+        query += ")"
+        capped = capped_accounts()
+        if capped:  # the daily limit is reached: first messages wait until tomorrow. Replies to members who answered still go.
+            query += " AND NOT (account_id IN ({}) AND {})".format(",".join("?" * len(capped)), TRUE_FIRST_SQL)
+            params.extend(capped)
+            for account in capped:
+                current = delivery_state(account)
+                if current["status"] != "sending":
+                    current["status"] = daily_limit_reason(daily_status(account))
+        cooling = cooling_accounts()
+        if cooling:  # an account that just sent a first message waits before the next first message. Replies are not held back by this.
+            query += " AND NOT (account_id IN ({}) AND {})".format(",".join("?" * len(cooling)), TRUE_FIRST_SQL)
+            params.extend(cooling)
+        now = time.monotonic()
+        reply_cooling = [account for account, until in next_reply_at.items() if until > now]
+        if reply_cooling:  # replies to different members are spaced a little too, but they never wait for first messages
+            query += " AND NOT (account_id IN ({}) AND NOT {})".format(",".join("?" * len(reply_cooling)), TRUE_FIRST_SQL)
+            params.extend(reply_cooling)
+        query += " ORDER BY send_after, id LIMIT 1"
         with connection() as conn:
             row = conn.execute(query, params).fetchone()
         if row:
             await deliver(row["id"])
         await asyncio.sleep(settings.delivery_poll_interval_seconds)
+
+
+# Serves the admin dashboard at /admin/. Mounted last so it never shadows an API route.
+app.mount("/admin", StaticFiles(directory=ADMIN_DIR, html=True), name="admin")

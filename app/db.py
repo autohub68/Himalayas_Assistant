@@ -56,7 +56,8 @@ def oauth_tokens_ddl(table: str) -> str:
             refresh_token TEXT,
             expires_at REAL,
             client_id TEXT NOT NULL,
-            client_secret TEXT
+            client_secret TEXT,
+            needs_reconnect INTEGER NOT NULL DEFAULT 0
         );"""
 
 
@@ -71,7 +72,9 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS accounts (
                 id TEXT PRIMARY KEY,
                 label TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                paused INTEGER NOT NULL DEFAULT 0,
+                last_seen TEXT
             );
             """
             + candidates_ddl("candidates")
@@ -90,6 +93,23 @@ def init_db() -> None:
                 read_at TEXT,
                 stage TEXT,
                 created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS himalayas_check (
+                candidate_id INTEGER PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                checked_at TEXT NOT NULL,
+                room TEXT,
+                total INTEGER NOT NULL DEFAULT 0,
+                ours INTEGER NOT NULL DEFAULT 0,
+                theirs INTEGER NOT NULL DEFAULT 0,
+                ours_read INTEGER NOT NULL DEFAULT 0,
+                last_when TEXT,
+                matches INTEGER NOT NULL DEFAULT 0,
+                note TEXT
+            );
+            CREATE TABLE IF NOT EXISTS app_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS processed_inbound (
                 external_id TEXT PRIMARY KEY,
@@ -118,13 +138,19 @@ def init_db() -> None:
 def migrate(conn: sqlite3.Connection) -> None:
     """Bring databases created by older versions up to the multi-account layout."""
     message_columns = columns(conn, "messages")
-    for name in ("error", "external_id", "read_at", "stage"):
+    for name in ("error", "external_id", "read_at", "stage", "variant"):
         if name not in message_columns:
-            conn.execute(f"ALTER TABLE messages ADD COLUMN {name} TEXT")
+            conn.execute(f"ALTER TABLE messages ADD COLUMN {name} {'INTEGER' if name == 'variant' else 'TEXT'}")
     if "account_id" not in message_columns:
         conn.execute("ALTER TABLE messages ADD COLUMN account_id TEXT NOT NULL DEFAULT ''")
     if "account_id" not in columns(conn, "oauth_state"):
         conn.execute("ALTER TABLE oauth_state ADD COLUMN account_id TEXT NOT NULL DEFAULT ''")
+
+    account_columns = columns(conn, "accounts")
+    if "paused" not in account_columns:
+        conn.execute("ALTER TABLE accounts ADD COLUMN paused INTEGER NOT NULL DEFAULT 0")
+    if "last_seen" not in account_columns:
+        conn.execute("ALTER TABLE accounts ADD COLUMN last_seen TEXT")
 
     candidate_columns = columns(conn, "candidates")
     if "account_id" not in candidate_columns:
@@ -146,10 +172,13 @@ def migrate(conn: sqlite3.Connection) -> None:
     if "suggested_role" not in columns(conn, "candidates"):
         conn.execute("ALTER TABLE candidates ADD COLUMN suggested_role TEXT")
 
+    if "needs_reconnect" not in columns(conn, "oauth_tokens") and "id" not in columns(conn, "oauth_tokens"):
+        conn.execute("ALTER TABLE oauth_tokens ADD COLUMN needs_reconnect INTEGER NOT NULL DEFAULT 0")
+
     if "id" in columns(conn, "oauth_tokens"):
         conn.execute(oauth_tokens_ddl("oauth_tokens_new").replace("CREATE TABLE IF NOT EXISTS", "CREATE TABLE"))
         conn.execute(
-            "INSERT INTO oauth_tokens_new SELECT ?, access_token, refresh_token, expires_at, client_id, client_secret FROM oauth_tokens",
+            "INSERT INTO oauth_tokens_new (account_id, access_token, refresh_token, expires_at, client_id, client_secret) SELECT ?, access_token, refresh_token, expires_at, client_id, client_secret FROM oauth_tokens",
             (LEGACY_ACCOUNT,),
         )
         conn.execute("DROP TABLE oauth_tokens")
@@ -200,7 +229,19 @@ def vacuum() -> None:
         conn.close()
 
 
-ACCOUNT_TABLES = ("candidates", "messages", "oauth_tokens", "oauth_state")
+def get_state(key: str, default: str | None = None) -> str | None:
+    """Small values the app learns and remembers, for example which wording of a message Himalayas accepts."""
+    with connection() as conn:
+        row = conn.execute("SELECT value FROM app_state WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def set_state(key: str, value: str) -> None:
+    with connection() as conn:
+        conn.execute("INSERT INTO app_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+
+
+ACCOUNT_TABLES = ("candidates", "messages", "oauth_tokens", "oauth_state", "himalayas_check")
 known_accounts: set[str] = set()
 
 

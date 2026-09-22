@@ -21,7 +21,7 @@ const errorText = (error) => { try { return JSON.parse(error.message).detail || 
 const STATUS_LABELS = {sent: 'Sent', failed: 'Failed', scheduled: 'Queued', approved: 'Approved', queued: 'Queued', skipped: 'Skipped', received: 'Received'};
 const STAGE_LABELS = {first_sent: 'Message 1 sent', intro_sent: 'Introduced', process_sent: 'Process explained', assessment_sent: 'Assessment sent', invite_pending: 'Invite pending', invited: 'GitHub invited', apply_sent: 'Application link sent', closed: 'Closed'};
 const statusLabel = (status) => STATUS_LABELS[status] || status;
-const stageLabel = (stage) => (stage ? (STAGE_LABELS[stage] || stage) : 'Not sent yet');
+const stageLabel = (stage) => (stage ? (STAGE_LABELS[stage] || (/^step_(\d+)$/.test(stage) ? `Message ${stage.slice(5)} sent` : stage)) : 'Not sent yet');
 const formatDate = (value) => (value ? new Date(value).toLocaleString([], {dateStyle: 'medium', timeStyle: 'short'}) : '—');
 const plural = (count, word) => `${count} ${word}${count === 1 ? '' : 's'}`;
 const tag = (status, label) => `<span class="tag ${escapeHtml(status)}">${escapeHtml(label || statusLabel(status))}</span>`;
@@ -72,12 +72,26 @@ function githubCell(member) {
   const note = failed ? '<span class="sub">invite failed</span>' : member.github_invited_at ? '<span class="sub">invited</span>' : '<span class="sub">not invited</span>';
   return `${escapeHtml(member.github_username)}<br>${note}`;
 }
+function himalayasCell(member) {
+  const h = member.himalayas;
+  if (!h) return '<span class="sub">not checked</span>';
+  if (!h.ok) return `<span class="himal bad">⚠ ${escapeHtml(h.note || 'differs')}</span>`;
+  return `<span class="himal ok">✓ ${h.total} message${h.total === 1 ? '' : 's'}</span><span class="sub">${h.read ? 'read by member' : 'not read yet'}${h.theirs ? ` · ${h.theirs} repl${h.theirs === 1 ? 'y' : 'ies'}` : ''}</span>`;
+}
+function liveBubble(message) {
+  const ours = message.who === 'company';
+  return `<div class="bubble ${ours ? 'outbound' : 'inbound'}"><div class="who">${ours ? 'Us' : 'Member'} · on Himalayas</div>${escapeHtml(message.body)}<div class="meta"><span>${escapeHtml(message.when || '')}</span>${ours ? `<span>${message.read ? '✓ read' : 'not read yet'}</span>` : ''}</div></div>`;
+}
+function reportCsv(items) {
+  const lines = items.map((m) => { const h = m.himalayas || {}; return [m.name, m.profile_url, h.room, m.outreach_status, h.total, h.ours, h.theirs, h.read, h.checked_at ? (h.ok ? 'yes' : 'no') : 'not checked', h.note].map(csvCell).join(','); });
+  return [['member', 'profile_url', 'himalayas_room', 'bot_status', 'messages_on_himalayas', 'ours', 'member_replies', 'ours_read', 'matches_bot', 'note'].join(','), ...lines].join('\n');
+}
 function rowHtml(member) {
   const retryId = member.outreach_status === 'failed' ? member.outreach_message_id : member.failed_message_id;
   const followUpFailed = member.failed_message_id && member.outreach_status !== 'failed';
   const problem = member.outreach_status === 'failed' || member.outreach_status === 'skipped' ? member.outreach_error : followUpFailed ? member.failed_error : null;
   return `<tr data-id="${member.id}"><td><span class="name">${escapeHtml(member.name)}</span><span class="sub">${escapeHtml(member.category === 'developer' ? 'Developer' : 'Business')}</span>${problem ? `<span class="err">${escapeHtml(problem)}</span>` : ''}</td>` +
-    `<td>${escapeHtml(member.role || '—')}</td><td>${tag(member.outreach_status)}${followUpFailed ? ' ' + tag('failed', 'Reply failed') : ''}</td>` +
+    `<td>${escapeHtml(member.role || '—')}</td><td>${tag(member.outreach_status)}${followUpFailed ? ' ' + tag('failed', 'Reply failed') : ''}</td><td>${himalayasCell(member)}</td>` +
     `<td>${escapeHtml(stageLabel(member.stage))}</td><td class="num">${member.replies}</td><td>${githubCell(member)}</td><td>${escapeHtml(formatDate(member.last_activity))}</td>` +
     `<td>${retryId ? `<button class="retry" data-retry="${retryId}">Retry</button>` : ''}</td></tr>`;
 }
@@ -87,7 +101,7 @@ function renderMembers() {
   const pages = Math.max(1, Math.ceil(items.length / state.pageSize));
   state.page = Math.min(state.page, pages - 1);
   const slice = items.slice(state.page * state.pageSize, (state.page + 1) * state.pageSize);
-  $('rows').innerHTML = slice.length ? slice.map(rowHtml).join('') : `<tr><td colspan="8" class="empty">${state.members.length ? 'No members match this filter.' : 'No members yet. Members appear here after their first message is queued.'}</td></tr>`;
+  $('rows').innerHTML = slice.length ? slice.map(rowHtml).join('') : `<tr><td colspan="9" class="empty">${state.members.length ? 'No members match this filter.' : 'No members yet. Members appear here after their first message is queued.'}</td></tr>`;
   document.querySelectorAll('#members th[data-sort]').forEach((header) => { header.classList.toggle('sorted', header.dataset.sort === state.sortKey); header.classList.toggle('desc', header.dataset.sort === state.sortKey && state.sortDir === 'desc'); });
   $('pager-info').textContent = `${plural(items.length, 'member')} · page ${state.page + 1} of ${pages}${state.matched > state.members.length ? ` · showing the newest ${state.members.length} of ${state.matched}` : ''}`;
   $('prev').disabled = state.page === 0;
@@ -122,6 +136,24 @@ function bubbleHtml(message) {
   const due = outbound && ['scheduled', 'approved'].includes(message.status) && message.send_after ? `<span>sends ${escapeHtml(formatDate(message.send_after))}</span>` : `<span>${escapeHtml(when)}</span>`;
   return `<div class="bubble ${outbound ? 'outbound' : 'inbound'}"><div class="who">${outbound ? 'Us' : 'Member'}</div>${escapeHtml(message.body)}<div class="meta">${tag(message.status)}${due}${message.error ? `<span class="err">${escapeHtml(message.error)}</span>` : ''}${retry}</div></div>`;
 }
+function liveMatches(live, local) {
+  // The bot's own messages that really left (or arrived), in the same words as the live copy from Himalayas.
+  const key = (text) => String(text || '').toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 40);
+  const mine = local.filter((m) => (m.direction === 'outbound' && m.status === 'sent') || m.direction === 'inbound');
+  const liveKeys = live.messages.map((m) => key(m.body));
+  return mine.length === live.messages.length && mine.every((m) => liveKeys.includes(key(m.body)));
+}
+async function loadLive(id, local = []) {
+  const box = document.getElementById('live-thread');
+  if (!box) return;
+  try {
+    const live = await request(`/api/conversations/${id}/himalayas`);
+    if (state.openId !== id) return;
+    if (liveMatches(live, local)) return;  // the same as the bot's record: nothing to show. The status under each message is enough
+    document.getElementById('live-section').hidden = false;
+    box.innerHTML = '<p class="note">Himalayas shows something different from the bot\'s record:</p>' + ([...live.messages].reverse().map(liveBubble).join('') || '<p class="muted">Himalayas holds no conversation with this member.</p>') + `<p class="note">Room: ${escapeHtml(live.room || '')}</p>`;
+  } catch (error) { /* a failed live check is not shown: it says nothing about this member */ }
+}
 async function openDetail(id, keepOpen = false) {
   state.openId = id;
   $('detail').hidden = false; $('scrim').hidden = false;
@@ -135,7 +167,9 @@ async function openDetail(id, keepOpen = false) {
     $('detail-body').innerHTML =
       `<dl class="facts"><dt>Category</dt><dd>${escapeHtml(c.category === 'developer' ? 'Developer' : 'Business')}</dd><dt>Profile</dt><dd>${profile}</dd><dt>GitHub</dt><dd>${escapeHtml(inviteText(c))}</dd>${c.github_email ? `<dt>Email</dt><dd>${escapeHtml(c.github_email)}</dd>` : ''}<dt>Messages</dt><dd>${data.messages.length}</dd></dl>` +
       (c.summary ? `<div><p class="group">PROFILE</p><div class="profile">${escapeHtml(c.summary.slice(0, 1500))}</div></div>` : '') +
-      `<div><p class="group">CONVERSATION</p><div class="thread">${data.messages.length ? data.messages.map(bubbleHtml).join('') : '<p class="muted">No messages.</p>'}</div></div>`;
+      `<div><p class="group">CONVERSATION</p><div class="thread">${data.messages.length ? data.messages.map(bubbleHtml).join('') : '<p class="muted">No messages.</p>'}</div></div>` +
+      `<div id="live-section" hidden><p class="group">CHECK ON HIMALAYAS (LIVE)</p><div id="live-thread" class="thread"></div></div>`;
+    loadLive(id, data.messages);
     $('detail-body').querySelectorAll('.retry').forEach((button) => { button.onclick = () => retryMessage(button); });
   } catch (error) { $('detail-name').textContent = 'Could not load this member'; $('detail-sub').textContent = errorText(error); }
 }
@@ -162,6 +196,23 @@ $('export').onclick = () => {
   const url = URL.createObjectURL(new Blob([membersCsv(visibleMembers())], {type: 'text/csv'}));
   const link = document.createElement('a');
   link.href = url; link.download = `members-${new Date().toISOString().slice(0, 10)}.csv`; link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+};
+
+$('verify').onclick = async () => {
+  const button = $('verify'), out = $('verify-result');
+  button.disabled = true; out.textContent = 'Reading every conversation from Himalayas… this can take a minute.';
+  try {
+    const r = await request('/api/db/verify-himalayas', {method: 'POST'});
+    out.textContent = `Himalayas holds ${r.conversations_on_himalayas} conversations. ${r.match} of ${r.checked} members match this bot.` + (r.missing_on_himalayas.length ? ` ${r.missing_on_himalayas.length} have a message the bot recorded but Himalayas does not show.` : '') + (r.replies_imported ? ` ${r.replies_imported} missed repl${r.replies_imported === 1 ? 'y was' : 'ies were'} added.` : '');
+    await loadMembers();
+  } catch (error) { out.textContent = `Could not check: ${errorText(error)}`; }
+  button.disabled = false;
+};
+$('report').onclick = () => {
+  const url = URL.createObjectURL(new Blob([reportCsv(state.members)], {type: 'text/csv'}));
+  const link = document.createElement('a');
+  link.href = url; link.download = `himalayas-report-${new Date().toISOString().slice(0, 10)}.csv`; link.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 };
 

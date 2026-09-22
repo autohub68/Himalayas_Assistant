@@ -14,9 +14,9 @@ A candidate reply moves the conversation one step forward, or gets a short answe
 import random
 from datetime import datetime, timedelta, timezone
 
-from . import ai
+from . import ai, prompted
 from .config import settings
-from .db import connection, utc_now
+from .db import connection, get_state, utc_now
 from .github import GitHubError, GitHubUserNotFound, detect_email, detect_username, invite_to_repository, repository_name, settings_ready
 
 FIRST, INTRO, PROCESS, ASSESSMENT, INVITE_PENDING, INVITED, APPLY, CLOSED = "first_sent", "intro_sent", "process_sent", "assessment_sent", "invite_pending", "invited", "apply_sent", "closed"
@@ -27,7 +27,11 @@ REPLY_DELAY_SECONDS = (40, 85)
 
 def category_for(role: str) -> str:
     """Candidate category from the suggested role."""
-    return "developer" if ai.is_developer_role(role) else "non_developer"
+    if ai.is_developer_role(role):
+        return "developer"
+    if role in ai.NON_DEV_ROLES:
+        return "non_developer"
+    return "developer" if ai.DEVELOPER_PATTERN.search(role or "") else "non_developer"  # a role written in a prompt, not in a list
 
 
 def current_stage(candidate_id: int) -> str | None:
@@ -63,13 +67,15 @@ async def plan_reply(candidate: dict, body: str, history: list[dict]) -> dict | 
     stage = current_stage(candidate["id"])
     if stage is None or stage == CLOSED:
         return None
+    if ai.PROMPTS.get("mode") == "prompt":
+        return await prompted.plan_reply(candidate, body, history, stage)
     name = candidate["name"]
     last_outbound = next((item["body"] for item in reversed(history) if item["direction"] == "outbound"), "")
     reading = await ai.read_reply(candidate, stage, last_outbound, body)
     intent = reading["intent"]
     role = candidate.get("suggested_role")
-    if not role:
-        # Contacted before roles were stored.
+    if not role or role not in ai.ALL_ROLES:
+        # Contacted before roles were stored, or the role is not in the current playbook.
         role = await ai.choose_role(candidate)
         with connection() as conn:
             conn.execute("UPDATE candidates SET suggested_role=?, category=? WHERE id=?", (role, category_for(role), candidate["id"]))
@@ -93,7 +99,8 @@ async def plan_reply(candidate: dict, body: str, history: list[dict]) -> dict | 
 
     if intent == "positive":
         if stage == FIRST:
-            return {"body": await ai.write_intro(candidate, role), "stage": INTRO}
+            level = int(get_state("intro_level", "1"))  # learned: the wording of the introduction that Himalayas accepts
+            return {"body": await ai.write_intro(candidate, role, level), "stage": INTRO, "variant": level}
         if stage == INTRO:
             return {"body": ai.process_message(name, role), "stage": PROCESS}
         # Process agreed. Developers take an assessment. Business roles apply on their careers page.
@@ -108,10 +115,11 @@ async def invite(candidate: dict, username: str, stage: str = ASSESSMENT) -> dic
     name = candidate["name"]
     with connection() as conn:
         conn.execute("UPDATE candidates SET github_username=? WHERE id=?", (username, candidate["id"]))
+    written = ai.PROMPTS.get("mode") == "prompt"
     try:
         await invite_to_repository(username)
     except GitHubUserNotFound:
-        return {"body": ai.username_not_found_message(name, username), "stage": ASSESSMENT}
+        return {"body": await prompted.invitation_message(candidate, username, "not_found") if written else ai.username_not_found_message(name, username), "stage": ASSESSMENT}
     except GitHubError as exc:
         # Our own setup problem (token, repository). The error shows in the chat details and the invitation is retried
         # automatically. The candidate gets one short holding message, not the error.
@@ -119,25 +127,26 @@ async def invite(candidate: dict, username: str, stage: str = ASSESSMENT) -> dic
             conn.execute("UPDATE candidates SET github_invited_at=? WHERE id=?", (f"failed: {exc}", candidate["id"]))
         if stage == INVITE_PENDING:
             return None  # the holding message was already sent
-        return {"body": ai.invite_pending_message(name), "stage": INVITE_PENDING}
+        return {"body": await prompted.invitation_message(candidate, username, "pending") if written else ai.invite_pending_message(name), "stage": INVITE_PENDING}
     with connection() as conn:
         conn.execute("UPDATE candidates SET github_invited_at=? WHERE id=?", (utc_now(), candidate["id"]))
-    return {"body": ai.invited_message(name, username, repository_name()), "stage": INVITED, "invited": True}
+    return {"body": await prompted.invitation_message(candidate, username, "invited") if written else ai.invited_message(name, username, repository_name()), "stage": INVITED, "invited": True}
 
 
 async def retry_invitation(candidate: dict) -> dict | None:
     """Retry an invitation that failed on our side. Returns the message to send, or None to try again later."""
+    written = ai.PROMPTS.get("mode") == "prompt"
     try:
         await invite_to_repository(candidate["github_username"])
     except GitHubUserNotFound:
-        return {"body": ai.username_not_found_message(candidate["name"], candidate["github_username"]), "stage": ASSESSMENT}
+        return {"body": await prompted.invitation_message(candidate, candidate["github_username"], "not_found") if written else ai.username_not_found_message(candidate["name"], candidate["github_username"]), "stage": ASSESSMENT}
     except GitHubError as exc:
         with connection() as conn:
             conn.execute("UPDATE candidates SET github_invited_at=? WHERE id=?", (f"failed: {exc}", candidate["id"]))
         return None
     with connection() as conn:
         conn.execute("UPDATE candidates SET github_invited_at=? WHERE id=?", (utc_now(), candidate["id"]))
-    return {"body": ai.invited_message(candidate["name"], candidate["github_username"], repository_name()), "stage": INVITED, "invited": True}
+    return {"body": await prompted.invitation_message(candidate, candidate["github_username"], "invited") if written else ai.invited_message(candidate["name"], candidate["github_username"], repository_name()), "stage": INVITED, "invited": True}
 
 
 def candidates_waiting_for_invitation() -> list:

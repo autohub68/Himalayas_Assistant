@@ -22,7 +22,7 @@ async function request(path, options = {}) {
   if (!response.ok) throw new Error(await response.text());
   return response.json();
 }
-const settingFields = ['openrouter_api_key', 'supabase_url', 'supabase_key', 'github_token', 'github_owner', 'github_repo', 'min_message_delay_seconds'];
+const settingFields = ['openrouter_api_key', 'supabase_url', 'supabase_key', 'github_token', 'github_owner', 'github_repo', 'min_message_delay_seconds', 'max_message_delay_seconds', 'daily_dm_limit'];
 async function loadSettings() {
   const [values, account] = await Promise.all([request('/api/settings'), request('/api/account')]);
   $('account_label').value = account.label || '';
@@ -64,6 +64,8 @@ function renderProgress(progress, delivery) {
   $('progress-state').textContent = delivery && delivery.status === 'sending' ? 'SENDING' : progress.queued ? 'SCHEDULED' : progress.sent ? 'COMPLETE' : 'IDLE';
   $('current-recipient').textContent = delivery && delivery.current_name ? delivery.current_name : (progress.next_recipient || 'No message waiting');
   $('next-delivery').textContent = progress.next_send_at ? formatTime(progress.next_send_at) : 'No scheduled message';
+  const daily = progress.daily;
+  $('daily-count').textContent = !daily ? '—' : daily.limit ? `${daily.sent_today} / ${daily.limit}${daily.reached ? ' · limit reached' : ''}` : `${daily.sent_today} (no limit)`;
   $('latest-result').textContent = progress.latest_recipient ? `${progress.latest_recipient}: ${progress.latest_status}${progress.latest_error ? ' · ledger warning retained' : ''}` : 'Waiting for delivery activity.';
 }
 function updateMetrics(allCandidates, pageCandidates, progress) {
@@ -90,7 +92,7 @@ function renderConversations(items) {
   const unread = items.reduce((total, item) => total + Number(item.unread_count || 0), 0);
   $('unread-badge').hidden = unread === 0;
   $('unread-badge').textContent = unread;
-  $('conversation-list').innerHTML = items.length ? items.map((item) => `<button class="conversation-row ${selectedConversation === item.id ? 'active' : ''} ${item.unread_count ? 'unread' : ''}" data-conversation-id="${item.id}"><span><strong>${escapeHtml(item.name)}</strong><small>${item.message_count} messages · ${formatTime(item.last_activity)}</small></span><span><span class="tag">${escapeHtml(item.conversation_status)}</span>${item.unread_count ? `<b class="row-unread">${item.unread_count}</b>` : ''}</span></button>`).join('') : '<p class="chat-empty">No conversations yet.</p>';
+  $('conversation-list').innerHTML = items.length ? items.map((item) => `<button class="conversation-row ${selectedConversation === item.id ? 'active' : ''} ${item.unread_count ? 'unread' : ''}" data-conversation-id="${item.id}"><span><strong>${escapeHtml(item.name)}</strong><small>${item.message_count} message${item.message_count === 1 ? '' : 's'} · ${formatTime(item.last_reply_at || item.last_activity)}</small>${item.last_reply ? `<small class="reply-preview">“${escapeHtml(item.last_reply)}”</small>` : ''}</span><span><span class="tag">${escapeHtml(item.conversation_status)}</span>${item.unread_count ? `<b class="row-unread">${item.unread_count}</b>` : ''}</span></button>`).join('') : '<p class="chat-empty">No conversations yet.</p>';
   document.querySelectorAll('[data-conversation-id]').forEach((button) => { button.onclick = () => loadConversation(Number(button.dataset.conversationId)); });
 }
 function renderConversationDetail(data) {
@@ -105,7 +107,7 @@ async function loadConversations() { const items = await request('/api/conversat
 async function refresh() {
   if (refreshing) return;
   refreshing = true;
-  try { const [health, allCandidates, progress, activity] = await Promise.all([request('/api/health'), request('/api/candidates'), request('/api/progress'), request('/api/activity')]); const candidates = allCandidates.filter((item) => candidatePage(item) === currentPage); $('service-dot').className = 'service-dot online'; setServerButton(true); $('status').textContent = `Service online · auto-send ${health.auto_send ? 'on' : 'off'}`; $('auth').textContent = health.himalayas_authorized ? 'Himalayas connected' : 'Connect Himalayas'; $('page-title').textContent = `Page ${currentPage}`; $('previous').disabled = currentPage === 1; $('page-count').textContent = candidates.length; $('last-updated').textContent = new Date().toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}); renderActivity(activity); renderProgress(progress, health.delivery); updateMetrics(allCandidates, candidates, progress); updateAutomation(health.automation); await loadConversations(); } catch (error) { $('service-dot').className = 'service-dot error'; $('status').textContent = 'Server offline · click Start server'; setServerButton(false); $('auth').textContent = 'Connect Himalayas'; } finally { refreshing = false; }
+  try { const [health, allCandidates, progress, activity] = await Promise.all([request('/api/health'), request('/api/candidates'), request('/api/progress'), request('/api/activity')]); const candidates = allCandidates.filter((item) => candidatePage(item) === currentPage); $('service-dot').className = 'service-dot online'; setServerButton(true); $('status').textContent = health.hold ? `Sending on hold: ${health.hold}` : `Service online · auto-send ${health.auto_send ? 'on' : 'off'}`; $('auth').textContent = health.himalayas_authorized ? 'Himalayas connected' : health.himalayas_login === 'expired' ? 'Login expired · Reconnect' : 'Connect Himalayas'; $('page-title').textContent = `Page ${currentPage}`; $('previous').disabled = currentPage === 1; $('page-count').textContent = candidates.length; $('last-updated').textContent = new Date().toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}); renderActivity(activity); renderProgress(progress, health.delivery); updateMetrics(allCandidates, candidates, progress); updateAutomation(health.automation); await loadConversations(); } catch (error) { $('service-dot').className = 'service-dot error'; $('status').textContent = 'Server offline · click Start server'; setServerButton(false); $('auth').textContent = 'Connect Himalayas'; } finally { refreshing = false; }
 }
 async function syncPage() { $('sync').disabled = true; $('sync').textContent = 'Syncing...'; $('status').textContent = `Loading page ${currentPage} from MCP...`; try { const result = await request(`/api/candidates/sync?page=${currentPage}`, {method: 'POST'}); await refresh(); $('status').textContent = `Page ${currentPage} synced · ${result.imported} profiles`; } catch (error) { $('status').textContent = `Sync failed: ${error.message}`; throw error; } finally { $('sync').disabled = false; $('sync').textContent = 'Sync page'; } }
 $('sync').onclick = syncPage;
@@ -131,9 +133,11 @@ $('auth').onclick = async () => { window.open(`${API}/api/auth/start?account_id=
 $('dashboard-tab').onclick = () => showTab('dashboard');
 $('chats-tab').onclick = () => showTab('chats');
 // The database opens as its own full-size page (new tab). window.open with a fixed name reuses that tab if it is already open.
+// One dashboard for every extension, served by the backend. It belongs to no Chrome profile.
+$('admin-link').onclick = () => { window.open('http://localhost:8765/admin/', 'hiring-admin'); };
 $('database-tab').onclick = () => { window.open(chrome.runtime.getURL('database.html'), 'hiring-database'); };
 $('settings-tab').onclick = () => showTab('settings');
-$('save-settings').onclick = async () => { const button = $('save-settings'); button.disabled = true; $('settings-result').textContent = 'Saving...'; const values = {}; settingFields.forEach((field) => { const value = $(field).value.trim(); if (value) values[field] = field === 'min_message_delay_seconds' ? Number(value) : value; }); try { await request('/api/settings', {method: 'PUT', body: JSON.stringify(values)}); await request('/api/account', {method: 'PUT', body: JSON.stringify({label: $('account_label').value.trim()})}); $('settings-result').textContent = 'Settings saved.'; } catch (error) { $('settings-result').textContent = `Save failed: ${error.message}`; } finally { button.disabled = false; } };
+$('save-settings').onclick = async () => { const button = $('save-settings'); button.disabled = true; $('settings-result').textContent = 'Saving...'; const values = {}; settingFields.forEach((field) => { const value = $(field).value.trim(); if (value !== '') values[field] = (field.endsWith('_delay_seconds') || field === 'daily_dm_limit') ? Number(value) : value; }); try { const saved = await request('/api/settings', {method: 'PUT', body: JSON.stringify(values)}); await request('/api/account', {method: 'PUT', body: JSON.stringify({label: $('account_label').value.trim()})}); const warnings = (saved && saved.warnings) || [], errors = (saved && saved.errors) || []; $('settings-result').textContent = errors.length ? `${saved.saved && saved.saved.length ? 'Saved. ' : ''}${errors.join(' ')}` : warnings.length ? `Settings saved. Note: ${warnings.join(' ')}` : 'Settings saved.'; await loadSettings(); } catch (error) { let detail = error.message; try { detail = JSON.parse(error.message).detail || detail; } catch (parseError) { /* plain text */ } $('settings-result').textContent = `Not saved: ${detail}`; } finally { button.disabled = false; } };
 async function connectDashboardEvents() {
   const source = new EventSource(`${API}/api/events?account_id=${encodeURIComponent(await accountReady)}`);
   source.addEventListener('dashboard-update', refresh);

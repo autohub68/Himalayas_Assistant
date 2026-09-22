@@ -65,9 +65,22 @@ def systemctl(action: str) -> None:
     subprocess.run(["systemctl", "--user", action, SERVICE_NAME], check=True, capture_output=True, timeout=30)
 
 
+def server_host() -> str:
+    """127.0.0.1 (this machine only) unless SERVER_HOST is set in settings.env, for example 0.0.0.0 to reach the dashboard from other machines."""
+    if os.environ.get("HIM_SERVER_HOST"):
+        return os.environ["HIM_SERVER_HOST"]
+    try:
+        for line in (STATE_DIR / "settings.env").read_text(encoding="utf-8").splitlines():
+            if line.strip().upper().startswith("SERVER_HOST="):
+                return line.split("=", 1)[1].strip() or "127.0.0.1"
+    except OSError:
+        pass
+    return "127.0.0.1"
+
+
 def spawn_backend() -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    command = [venv_python(), "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8765"]
+    command = [venv_python(), "-m", "uvicorn", "app.main:app", "--host", server_host(), "--port", "8765"]
     options = {"cwd": PROJECT_DIR, "stdin": subprocess.DEVNULL, "stderr": subprocess.STDOUT}
     if os.name == "nt":
         options["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP

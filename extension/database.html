@@ -49,13 +49,14 @@
           <div id="chips" class="chips"></div>
           <div class="toolbar-right">
             <input id="search" type="search" placeholder="Search member name" autocomplete="off">
-            <button id="export" class="secondary">Export CSV</button>
+            <button id="verify" class="secondary" title="Read every conversation from Himalayas and compare it with this bot">Verify with Himalayas</button><button id="report" class="secondary" title="CSV for Himalayas support: member, room name, messages, read receipts">Himalayas report</button><button id="export" class="secondary">Export CSV</button>
           </div>
         </div>
+        <p id="verify-result" class="note"></p>
         <div class="table-wrap">
           <table id="members">
             <thead><tr>
-              <th data-sort="name">Member</th><th data-sort="role">Suggested role</th><th data-sort="outreach_status">Status</th>
+              <th data-sort="name">Member</th><th data-sort="role">Suggested role</th><th data-sort="outreach_status">Status</th><th>On Himalayas</th>
               <th data-sort="stage">Chat step</th><th data-sort="replies" class="num">Replies</th><th data-sort="github_username">GitHub</th>
               <th data-sort="last_activity">Last activity</th><th></th>
             </tr></thead>

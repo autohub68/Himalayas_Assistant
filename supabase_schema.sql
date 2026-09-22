@@ -23,8 +23,10 @@ using (true)
 with check (true);
 
 -- Outreach status (run once, safe to run again).
--- Each member has one row. status is "queued" (first message scheduled), "sent", or "failed".
--- Only "sent" counts as contacted. Existing rows are all sent, so they become "sent".
+-- Each member has one row. status is "queued" (one profile has claimed the member and will send),
+-- "sent", or "failed". Both "queued" and "sent" block every other profile from a first message.
+-- Only the profile that wrote the "queued" row may still deliver that message.
+-- Existing rows are all sent, so they become "sent".
 alter table public.outreach_contacts add column if not exists status text not null default 'sent';
 alter table public.outreach_contacts add column if not exists error text;
 alter table public.outreach_contacts add column if not exists account_id text;

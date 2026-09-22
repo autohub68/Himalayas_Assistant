@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Control center · Hiring Assistant</title>
+  <link rel="stylesheet" href="admin.css">
+</head>
+<body>
+  <header class="top">
+    <div class="brand"><span class="brand-mark">H</span><div><p class="eyebrow">HIMALAYAS / RECRUITING</p><h1>Control center</h1></div></div>
+    <div class="top-right">
+      <span id="global-unread" class="unread-badge global-unread" hidden title="Unread member replies across every profile">0</span>
+      <span id="server-pill" class="pill">Connecting…</span>
+      <span id="updated" class="updated"></span>
+      <button id="refresh" class="secondary">Refresh</button>
+      <button id="logout" class="secondary" hidden>Log out</button>
+    </div>
+  </header>
+
+  <div id="checks" class="checks"></div>
+
+  <nav class="tabs" id="main-tabs">
+    <button data-view="accounts" class="active">Accounts <span id="accounts-unread-badge" class="unread-badge" hidden>0</span></button>
+    <button data-view="playbook">Playbook</button>
+    <button data-view="settings">Settings</button>
+  </nav>
+  <div id="toast" class="toast" hidden></div>
+
+  <!-- ===== All accounts ===== -->
+  <section id="view-accounts" class="view">
+    <div class="bulk">
+      <div><strong>All accounts</strong><span class="muted"> · one control bar for every Chrome profile</span></div>
+      <div class="bulk-buttons">
+        <button id="all-start" class="secondary">Start automation</button>
+        <button id="all-stop" class="secondary">Stop automation</button>
+        <button id="all-pause" class="secondary">Pause sending</button>
+        <button id="all-resume" class="secondary">Resume sending</button>
+      </div>
+    </div>
+    <div id="totals" class="cards"></div>
+    <div id="accounts" class="accounts"></div>
+    <p id="accounts-empty" class="empty" hidden>No extension has connected yet. Load the extension in a Chrome profile and open its popup. It appears here automatically.</p>
+  </section>
+
+  <!-- ===== One account ===== -->
+  <section id="view-account" class="view" hidden>
+    <button id="back" class="link">← All accounts</button>
+    <div class="panel account-head">
+      <div class="account-title">
+        <input id="account-label" type="text" maxlength="60" placeholder="Name this profile (e.g. Recruiter A)">
+        <button id="account-save" class="secondary">Save name</button>
+      </div>
+      <p id="account-meta" class="muted"></p>
+      <div class="account-actions">
+        <button id="a-automation"></button>
+        <button id="a-pause" class="secondary"></button>
+        <a id="a-connect" class="button-link" target="_blank" rel="noopener">Connect Himalayas</a>
+      </div>
+      <div id="account-alerts" class="alerts"></div>
+    </div>
+    <nav class="tabs sub" id="account-tabs">
+      <button data-tab="overview" class="active">Overview</button>
+      <button data-tab="members">Members <span id="unread-badge" class="unread-badge" hidden>0</span></button>
+      <button data-tab="clean">Clean up</button>
+    </nav>
+
+    <div id="tab-overview" class="tab">
+      <div id="progress-cards" class="cards"></div>
+      <div class="two">
+        <div class="panel"><h2>Live status</h2><dl id="live" class="facts"></dl></div>
+        <div class="panel"><h2>Recent activity</h2><div id="activity" class="activity"></div></div>
+      </div>
+    </div>
+
+    <div id="tab-members" class="tab" hidden>
+      <div class="panel">
+        <div class="toolbar">
+          <div id="chips" class="chips"></div>
+          <div class="toolbar-right"><button id="retry-failed" class="secondary" title="Rewrite the first messages that were not delivered in a short, neutral style and queue them again">Rewrite &amp; retry…</button><input id="search" type="search" placeholder="Search member name" autocomplete="off"><button id="verify" class="secondary" title="Read every conversation from Himalayas and compare it with this bot">Verify with Himalayas</button><button id="report" class="secondary" title="CSV for Himalayas support: member, room name, messages, read receipts">Himalayas report</button><button id="export" class="secondary">Export CSV</button></div>
+        </div>
+        <p id="verify-result" class="note"></p>
+        <div class="table-wrap">
+          <table id="members">
+            <thead><tr>
+              <th data-sort="name">Member</th><th data-sort="role">Suggested role</th><th data-sort="outreach_status">Status</th><th>On Himalayas</th>
+              <th data-sort="stage">Chat step</th><th data-sort="replies" class="num">Replies</th><th data-sort="github_username">GitHub</th>
+              <th data-sort="last_activity">Last activity</th><th></th>
+            </tr></thead>
+            <tbody id="rows"></tbody>
+          </table>
+        </div>
+        <div class="pager"><span id="pager-info" class="muted"></span><span><button id="prev" class="secondary">Previous</button> <button id="next" class="secondary">Next</button></span></div>
+      </div>
+    </div>
+
+    <div id="tab-clean" class="tab" hidden>
+      <div class="panel narrow">
+        <h2>Clean up this profile's data</h2>
+        <p class="note">Removes members and all of their messages for this profile only. The Himalayas login and settings are kept. The shared Supabase contact ledger is not touched, so nobody who was already contacted is ever messaged twice. A backup file is saved before anything is deleted.</p>
+        <p id="clean-current" class="note strong"></p>
+        <h3>Delete by date</h3>
+        <label for="clean-from">From (last activity)</label><input id="clean-from" type="date">
+        <label for="clean-to">To (last activity)</label><input id="clean-to" type="date">
+        <p class="note">A member's last activity is their latest message, or the import date if none. Leave one date empty to delete everything before or after the other.</p>
+        <button id="clean-preview" class="secondary">Preview</button>
+        <div id="clean-summary" class="clean-summary" hidden></div>
+        <button id="clean-confirm" class="danger" hidden>Delete these members</button>
+        <h3>Delete everything</h3>
+        <p class="note">Type DELETE to enable the button.</p>
+        <input id="clean-all-text" type="text" placeholder="DELETE" autocomplete="off">
+        <button id="clean-all" class="danger" disabled>Delete all data</button>
+        <p id="clean-result" class="result"></p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== Playbook (.md) ===== -->
+  <section id="view-playbook" class="view" hidden>
+    <div class="panel">
+      <h2>Playbook</h2>
+      <p class="note">One .md file holds everything that belongs to a company and a freelance platform. The simplest way is a <b>prompt playbook</b>: you write four prompts in plain language (company and roles, first message, chat logic, style) and the AI writes message 1 and every reply from them. The bot itself does not change. Import another file to use the bot for another company or platform. It applies to every profile at once and takes effect immediately. No restart is needed.</p>
+      <div id="pb-active"></div>
+      <div class="pb-buttons">
+        <button id="pb-download" class="secondary">Download active playbook (.md)</button>
+        <button id="pb-template-prompts" class="secondary" title="Four prompts (company and roles, first message, chat logic, style). The AI writes everything from them. Edit them for another company or platform.">Download prompt template (.md)</button>
+        <button id="pb-template" class="secondary" title="The same content as fixed fields and texts, for finer control.">Download fixed-text template</button>
+        <button id="pb-reset" class="secondary">Back to built-in</button>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>Import a playbook</h2>
+      <p class="note">Choose a .md file, or paste the text. <b>Check</b> reads it and shows problems and sample messages, and changes nothing. <b>Use this playbook</b> applies it. Messages that are already queued keep their old wording.</p>
+      <input id="pb-file" type="file" accept=".md,.markdown,.txt,text/markdown,text/plain">
+      <textarea id="pb-text" spellcheck="false" placeholder="# Playbook: Company on Platform&#10;&#10;## Company&#10;Name: ...&#10;Website: https://...&#10;&#10;### About&#10;...&#10;&#10;## Roles&#10;### Role name&#10;Type: developer&#10;Rate: ..."></textarea>
+      <div class="pb-buttons"><button id="pb-check" class="secondary">Check</button><button id="pb-apply" disabled>Use this playbook</button></div>
+      <div id="pb-report"></div>
+      <div id="pb-try" class="pb-try" hidden>
+        <h3>Try it (nothing is sent)</h3>
+        <p class="note">Write message 1 for a sample member from the prompts above. Add a member answer to see the next reply. This uses your OpenRouter key.</p>
+        <label for="pb-profile">Sample member profile</label><textarea id="pb-profile" rows="3">Senior software engineer with 8 years of experience in Python, FastAPI, PostgreSQL and AWS. Built payment APIs and led a small team.</textarea>
+        <label for="pb-reply">Member answer (optional)</label><input id="pb-reply" type="text" placeholder="For example: Yes, I am interested. What is the pay?">
+        <div class="pb-buttons"><button id="pb-try-run" class="secondary">Write a sample</button></div>
+        <div id="pb-try-out"></div>
+      </div>
+    </div>
+    <details class="panel">
+      <summary><b>How to write the file</b></summary>
+      <div class="note">
+        <p><b>Prompt playbook (recommended).</b> Start from <b>Download prompt template</b>. It has four sections. Write them in plain language:</p>
+        <ul>
+          <li><b>## Company and roles</b>: everything the AI may say: the company, the roles, pay, application links, the assessment. The AI states nothing that is not here.</li>
+          <li><b>## First message prompt</b>: how message 1 must look (length, tone, what to mention, what to avoid).</li>
+          <li><b>## Chat logic prompt</b>: the steps of the conversation and what to do when the member answers, asks a question, gives a GitHub username, or declines. The AI can send a GitHub invitation (write "when the member sends a username, use the action invite_github") or close the chat.</li>
+          <li><b>## Style rules</b> (optional): how every message is written.</li>
+        </ul>
+        <p>Fixed by the system, whatever the prompts say: the member's name is used in message 1 only; a pay figure or a link is sent only if it is written in the prompts; messages are short plain text; a refused message is rewritten and resent at once.</p>
+        <p><b>Fixed-text playbook.</b> Start from <b>Download fixed-text template</b> for finer control. Every section is optional except <b>Company</b> and <b>Roles</b>. A section you leave out keeps the built-in text.</p>
+        <ul>
+          <li><b>## Company</b>: <code>Name:</code> as the platform shows it, <code>Website:</code>, <code>Careers page:</code>, and <code>### About</code> (what the company does. The AI may use only this).</li>
+          <li><b>## Roles</b>: one <code>### Role name</code> each, with <code>Type: developer</code> (assessment on GitHub) or <code>Type: business</code> (application link), <code>Rate:</code> (inserted word for word in message 2), and for business roles <code>Summary:</code> (one sentence that starts with a verb), <code>Interview:</code>, <code>Careers link:</code>, and <code>#### Details</code> (the only facts the AI may give about the role).</li>
+          <li><b>## First message</b>, <b>## Introduction lines</b>: rotating sentences for messages 1 and 2. Keep them free of words the platform's spam filter refuses.</li>
+          <li><b>## Questions</b>, <b>## Messages</b>, <b>## Assessments</b>: the question that ends each step, the fixed texts for steps 3 and 4, and the GitHub assessment for each developer role.</li>
+          <li><b>## Writing rules</b>, <b>## Role choice rules</b>: the prompt rules for the AI.</li>
+        </ul>
+        <p>Placeholders: <code>{company} {website} {careers} {role} {url} {interview} {username} {repository}</code>. The member's name is used in message 1 only, so <code>{name}</code> is not allowed anywhere else.</p>
+        <p>The file changes what the bot says. It does not change which platform the bot connects to. That is set by the MCP server URL in the server settings.</p>
+      </div>
+    </details>
+  </section>
+
+  <!-- ===== Shared settings ===== -->
+  <section id="view-settings" class="view" hidden>
+    <div class="panel narrow">
+      <h2>Settings shared by every profile</h2>
+      <p class="note">Secrets are masked. Leave a secret blank to keep its current value. Account names are set on each account.</p>
+      <h3>AI messages</h3>
+      <label for="openrouter_api_key">OpenRouter API key</label><input id="openrouter_api_key" type="text" autocomplete="off" spellcheck="false" class="secret">
+      <h3>Contact ledger (Supabase)</h3>
+      <label for="supabase_url">Supabase URL</label><input id="supabase_url" type="url">
+      <label for="supabase_key">Supabase key</label><input id="supabase_key" type="text" autocomplete="off" spellcheck="false" class="secret">
+      <h3>GitHub assessment access</h3>
+      <label for="github_token">GitHub token</label><input id="github_token" type="text" autocomplete="off" spellcheck="false" class="secret">
+      <label for="github_owner">Repository owner</label><input id="github_owner" type="text">
+      <label for="github_repo">Repository name</label><input id="github_repo" type="text">
+      <h3>Sending</h3>
+      <label for="daily_dm_limit">Daily DM limit (new members per profile per day)</label><input id="daily_dm_limit" type="number" min="0" max="100000" placeholder="0 = no limit"><p class="note">New members this profile messages each day. Replies to members who answered are not counted and are never blocked. Each profile has its own count. The day resets at 00:00 UTC. 0 means no limit.</p><label for="min_message_delay_seconds">Shortest gap between first messages (seconds)</label><input id="min_message_delay_seconds" type="number" min="5"><label for="max_message_delay_seconds">Longest gap between first messages (seconds)</label><input id="max_message_delay_seconds" type="number" min="5"><p class="note">Each gap is a random value between the two. A refusal by Himalayas never changes it.</p>
+      <button id="save-settings" class="save">Save settings</button>
+      <p id="settings-result" class="result"></p>
+    </div>
+  </section>
+
+  <div id="scrim" class="scrim" hidden></div>
+  <aside id="detail" class="detail" hidden>
+    <div class="detail-head"><div><h2 id="detail-name"></h2><p id="detail-sub" class="muted"></p></div><button id="detail-close" class="secondary">Close</button></div>
+    <div id="detail-body" class="detail-body"></div>
+  </aside>
+
+  <script src="admin.js"></script>
+</body>
+</html>
