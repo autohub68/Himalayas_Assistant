@@ -43,6 +43,13 @@
     <div id="accounts" class="accounts"></div>
     <p id="accounts-offline-note" class="note" hidden></p>
     <p id="accounts-empty" class="empty" hidden>No Chrome extension is online. Load the extension in a Chrome profile — it appears here within a few seconds. Remove the extension and its card disappears.</p>
+    <div class="panel ops-log-panel">
+      <div class="toolbar">
+        <div><strong>Operations log</strong><span class="muted"> · full details (cards show short hints only)</span></div>
+        <button id="ops-log-refresh" class="secondary">Refresh</button>
+      </div>
+      <div id="ops-log" class="ops-log"></div>
+    </div>
   </section>
 
   <!-- ===== Shared Supabase ledger ===== -->

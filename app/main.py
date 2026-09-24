@@ -142,7 +142,56 @@ def reply_monitor_state(account_id: str) -> dict:
 
 
 def delivery_state(account_id: str) -> dict:
-    return delivery_states.setdefault(account_id, {"running": True, "status": "idle", "current_id": None, "current_name": None})
+    return delivery_states.setdefault(account_id, {"running": True, "status": "idle", "detail": "", "current_id": None, "current_name": None})
+
+
+OPS_LOG_KEEP = 500
+
+
+def note_ops(account_id: str, level: str, hint: str, detail: str = "") -> None:
+    """Append one Control-center log row. Hint is short; detail is the full reason (shown in the log panel)."""
+    label = account_label(account_id) if account_id else "Server"
+    text = (detail or hint or "").strip()
+    short = (hint or text.split(".")[0] or "note").strip()[:80]
+    with connection() as conn:
+        conn.execute(
+            "INSERT INTO ops_log (account_id, account_label, level, hint, detail, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (account_id or "", label or account_id or "Server", level, short, text[:2000], utc_now()),
+        )
+        # Keep the table small.
+        conn.execute(
+            "DELETE FROM ops_log WHERE id NOT IN (SELECT id FROM ops_log ORDER BY id DESC LIMIT ?)",
+            (OPS_LOG_KEEP,),
+        )
+    publish_dashboard_update("ops_log", account_id or "")
+
+
+def hold_hint(reason: str) -> str:
+    """Short status for account cards. Full text belongs in the ops log."""
+    lower = (reason or "").lower()
+    if "rate limit" in lower or "messages/minute" in lower:
+        return "on hold · rate limit"
+    if "daily limit" in lower:
+        return "on hold · daily limit"
+    if "ledger" in lower or "supabase" in lower:
+        return "on hold · ledger"
+    if "login" in lower or "expired" in lower or "authorization" in lower or "reconnect" in lower:
+        return "on hold · login"
+    if "not opening" in lower or "cannot reopen" in lower or "outage" in lower:
+        return "on hold · Himalayas outage"
+    if "refused" in lower and ("in a row" in lower or "in " in lower and "minute" in lower):
+        return "on hold · pacing"
+    if "korea" in lower:
+        return "skipped · Korea"
+    if reason.startswith("on hold"):
+        return "on hold"
+    line = reason.split("\n")[0].strip()
+    return line[:48] + ("…" if len(line) > 48 else "")
+
+
+def is_rate_limit_error(exc: Exception | str) -> bool:
+    text = str(exc).lower()
+    return "rate limit" in text or "messages/minute" in text or ("please wait" in text and "reject" in text)
 
 
 last_seen_written: dict[str, float] = {}
@@ -1050,52 +1099,7 @@ async def mark_conversation_read(candidate_id: int, account: Account) -> dict:
     return {"marked_read": updated}
 
 
-# ---- Database view (per account) ----
-
-LEDGER_COLUMNS = [
-    ("id", "bigint", True), ("talent_slug", "text", False), ("candidate_name", "text", False), ("profile_url", "text", False),
-    ("summary", "text", False), ("category", "text", False), ("stack", "jsonb", False), ("country", "text", False),
-    ("message_id", "bigint", False), ("message_body", "text", False), ("status", "text", False), ("error", "text", False),
-    ("account_id", "text", False), ("account_label", "text", False), ("sent_at", "timestamptz", False),
-    ("created_at", "timestamptz", False), ("updated_at", "timestamptz", False),
-]
-TABLE_INFO = [
-    ("accounts", "Chrome profiles that use this server"),
-    ("candidates", "Members imported from Himalayas, with the role suggested for each"),
-    ("messages", "Every message sent to or received from a member"),
-]
-
-
-@app.get("/api/db/structure")
-async def db_structure(account: Account) -> dict:
-    tables = []
-    with connection() as conn:
-        for name, description in TABLE_INFO:
-            columns = [
-                {"name": row["name"], "type": (row["type"] or "TEXT").upper(), "primary_key": bool(row["pk"]), "required": bool(row["notnull"])}
-                for row in conn.execute(f"PRAGMA table_info({name})")
-                if row["name"] != "account_id" or name != "accounts"
-            ]
-            if name == "accounts":
-                rows = 1
-            else:
-                rows = conn.execute(f"SELECT COUNT(*) FROM {name} WHERE account_id=?", (account,)).fetchone()[0]
-            tables.append({"name": name, "description": description, "rows": rows, "columns": columns})
-    try:
-        ledger_ready = await SupabaseLedger().status_ready()
-    except Exception:
-        ledger_ready = None  # Supabase is not configured or not reachable
-    return {
-        "tables": tables,
-        "ledger_status_ready": ledger_ready,
-        "links": ["messages.candidate_id → candidates.id", "candidates.account_id → accounts.id", "messages.account_id → accounts.id"],
-        "external": {
-            "name": settings.supabase_table,
-            "description": "Shared contact ledger on Supabase. One row per member who was contacted. Every account checks it before a first message.",
-            "columns": [{"name": name, "type": kind.upper(), "primary_key": pk, "required": False} for name, kind, pk in LEDGER_COLUMNS],
-        },
-        "note": "Row counts are for this Chrome profile only. Login tokens are stored in the database but never shown here.",
-    }
+# ---- Per-account members (Control center) ----
 
 
 def member_rows(account_id: str) -> list[dict]:
@@ -1419,6 +1423,17 @@ async def admin_ledger_member(talent_slug: str) -> dict:
             )
         ]
     return {"contact": contact, "local": local}
+
+
+@app.get("/api/admin/ops-log")
+async def admin_ops_log(limit: int = Query(80, ge=1, le=300)) -> dict:
+    """Recent hold / refusal / skip details for the Control center log panel (cards show short hints only)."""
+    with connection() as conn:
+        rows = conn.execute(
+            "SELECT id, account_id, account_label, level, hint, detail, created_at FROM ops_log ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return {"items": [dict(row) for row in rows]}
 
 
 @app.get("/api/admin/overview")
@@ -2110,7 +2125,13 @@ def recent_first_messages(account_id: str, limit: int = 15) -> list[str]:
             (account_id, limit),
         ).fetchall()
     return [row["body"] for row in rows]
+
+
 HOLD_SECONDS = 60
+# Himalayas caps send_message at 10/minute. Wait just over a minute, then retry the same body.
+RATE_LIMIT_HOLD_SECONDS = 70
+# After this many refusals for one member, switch to the neutral/safer template before giving up at MAX_REFUSALS_PER_MEMBER.
+SAFER_AFTER_REFUSALS = 2
 holds: dict[str, dict] = {}  # "ledger" for the shared contact ledger, or an account id for its Himalayas login
 
 
@@ -2139,10 +2160,10 @@ def hold_reason(account_id: str) -> str | None:
 
 def hold_first_messages(account_id: str, reason: str) -> None:
     """Hold FIRST messages for a few minutes. Replies to members who answered keep going. It ends by itself."""
-    holds["first:" + account_id] = {
-        "reason": f"Himalayas refused {REFUSED_MEMBERS_BEFORE_HOLD} different members in a row, so first messages wait {FIRST_HOLD_SECONDS // 60} minutes. Replies keep going. {reason[:160]}",
-        "since": utc_now(), "until": time.monotonic() + FIRST_HOLD_SECONDS,
-    }
+    detail = f"Himalayas refused {REFUSED_MEMBERS_BEFORE_HOLD} different members in a row, so first messages wait {FIRST_HOLD_SECONDS // 60} minutes. Replies keep going. {reason[:160]}"
+    holds["first:" + account_id] = {"reason": detail, "since": utc_now(), "until": time.monotonic() + FIRST_HOLD_SECONDS}
+    delivery_state(account_id).update({"status": hold_hint(detail), "detail": detail, "current_id": None, "current_name": None})
+    note_ops(account_id, "warn", hold_hint(detail), detail)
     publish_dashboard_update("paused", account_id)
 
 
@@ -2233,14 +2254,21 @@ async def requeue_rephrased(row, account_id: str) -> int | None:
         return None
 
 
-async def requeue_rewritten(row, account_id: str) -> int | None:
-    """After a spam refusal, write that member a different first message. It is due at once. Best effort."""
+async def requeue_rewritten(row, account_id: str, safer: bool = False) -> int | None:
+    """After a spam refusal, write that member a different first message. It is due at once. Best effort.
+    With safer=True the wording is shorter and more neutral (used after repeated refusals)."""
     try:
         with connection() as conn:
             candidate = conn.execute("SELECT * FROM candidates WHERE id=?", (row["candidate_id"],)).fetchone()
         if already_sent_this_step(row["candidate_id"], "first_sent"):
             return None
-        fresh = await write_first_message(parse_candidate(candidate), fixed_role=candidate["suggested_role"] or None, recent=[row["body"], *recent_first_messages(account_id)])
+        item = parse_candidate(candidate)
+        if safer:
+            # Prefer the fixed neutral template after several refusals — less likely to trip the spam filter.
+            role = candidate["suggested_role"] or chat.ai.default_role(True)
+            fresh = {"role": role, "message": chat.ai.neutral_first_message(item, role)}
+        else:
+            fresh = await write_first_message(item, fixed_role=candidate["suggested_role"] or None, recent=[row["body"], *recent_first_messages(account_id)])
         with connection() as conn:
             new_id = conn.execute(
                 "INSERT INTO messages (account_id, candidate_id, direction, body, status, send_after, stage, created_at) VALUES (?, ?, 'outbound', ?, 'scheduled', ?, 'first_sent', ?)",
@@ -2280,7 +2308,9 @@ def hold_message(message_id: int, account_id: str, reason: str, seconds: int = H
     later = (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
     with connection() as conn:
         conn.execute("UPDATE messages SET send_after=? WHERE id=?", (later, message_id))
-    delivery_state(account_id).update({"status": f"on hold: {reason}", "current_id": None, "current_name": None})
+    hint = hold_hint(reason)
+    delivery_state(account_id).update({"status": hint, "detail": reason, "current_id": None, "current_name": None})
+    note_ops(account_id, "warn", hint, reason)
     publish_dashboard_update("delivery_held", account_id)
     return "held"
 
@@ -2408,16 +2438,24 @@ async def deliver(message_id: int) -> str:
             publish_dashboard_update("paused", account_id)
             return hold_message(message_id, account_id, reason, pause)
         except HimalayasRejected as exc:
-            # Himalayas refused it, so it was not delivered. Mark it failed with the real reason. If this keeps happening the
-            # problem is with the account, not the message, so stop sending instead of failing the whole queue.
+            # Rate limits are temporary pacing (10/min), not spam. Keep the message queued, wait, retry the same body.
+            # Do not count toward refusal streaks or trigger rewrites — otherwise bots stall on "Failed" and long holds.
+            if is_rate_limit_error(exc):
+                reason = f"Rate limit reached (10 messages/minute). Please wait. Retrying the same message shortly. {str(exc)[:120]}"
+                return hold_message(message_id, account_id, reason, RATE_LIMIT_HOLD_SECONDS)
+
+            # Himalayas refused it, so it was not delivered. Mark it failed with the real reason. The bot keeps working:
+            # rewrite (safer after a few tries), skip this member after MAX_REFUSALS_PER_MEMBER, move to the next.
             with connection() as conn:
                 conn.execute("UPDATE messages SET status='failed', error=? WHERE id=?", (str(exc), message_id))
-            state.update({"status": "failed", "current_id": None, "current_name": None})
+            spam_refusal = any(word in str(exc).lower() for word in ("filter", "spam"))
+            hint = "refused · spam filter" if spam_refusal else "send refused"
+            state.update({"status": hint, "detail": str(exc), "current_id": None, "current_name": None})
+            note_ops(account_id, "warn", hint, str(exc))
             if first_contact:
                 await note_ledger(account_id, ledger_candidate(row), "failed", message_id, row["body"], str(exc))
-            spam_refusal = any(word in str(exc).lower() for word in ("filter", "spam"))
             refused = refusals_for_member(row["candidate_id"])
-            if first_contact:
+            if first_contact and spam_refusal:
                 # Count DIFFERENT members refused in a row. The same member refused again is not a sign of a block.
                 streak = rejection_streak.setdefault(account_id, [])
                 if row["candidate_id"] not in streak:
@@ -2429,29 +2467,52 @@ async def deliver(message_id: int) -> str:
                 recent = [t for t in refusal_times.get(account_id, []) if now - t < REFUSAL_WINDOW_SECONDS] + [now]
                 refusal_times[account_id] = recent
                 if first_contact and len(recent) >= REFUSALS_PER_WINDOW and not hold_active("first:" + account_id):
+                    detail = (
+                        f"Himalayas refused {len(recent)} messages in {REFUSAL_WINDOW_SECONDS // 60} minutes, "
+                        f"so first messages wait {FIRST_HOLD_SECONDS // 60} minutes. Replies keep going. {str(exc)[:120]}"
+                    )
                     holds["first:" + account_id] = {
-                        "reason": f"Himalayas refused {len(recent)} messages in {REFUSAL_WINDOW_SECONDS // 60} minutes, so first messages wait {FIRST_HOLD_SECONDS // 60} minutes. Replies keep going. {str(exc)[:120]}",
-                        "since": utc_now(), "until": time.monotonic() + FIRST_HOLD_SECONDS,
+                        "reason": detail, "since": utc_now(), "until": time.monotonic() + FIRST_HOLD_SECONDS,
                     }
+                    delivery_state(account_id).update({
+                        "status": hold_hint(detail), "detail": detail, "current_id": None, "current_name": None,
+                    })
+                    note_ops(account_id, "warn", hold_hint(detail), detail)
                     publish_dashboard_update("paused", account_id)
             on_hold = hold_active("first:" + account_id) if first_contact else False
             if spam_refusal:
                 if row["stage"] == "intro_sent":
                     note_intro_result(row["variant"] or 0, True)
                 if refused >= MAX_REFUSALS_PER_MEMBER:
+                    give_up = f"Gave up after {refused} refusals for this member. Skipping to the next. {exc}"
                     with connection() as conn:
-                        conn.execute("UPDATE messages SET error=? WHERE id=?", (f"Gave up: Himalayas refused {refused} different messages to this member. {exc}", message_id))
+                        conn.execute("UPDATE messages SET error=? WHERE id=?", (give_up, message_id))
+                        conn.execute(
+                            "UPDATE messages SET status='skipped', error=? "
+                            "WHERE candidate_id=? AND direction='outbound' AND status IN ('scheduled', 'approved') "
+                            "AND COALESCE(stage, 'first_sent')=? AND id!=?",
+                            (f"Skipped: gave up after {refused} refusals for this member", row["candidate_id"], row["stage"] or "first_sent", message_id),
+                        )
+                    state.update({"status": "skipped · too many refusals", "detail": give_up, "current_id": None, "current_name": None})
+                    note_ops(account_id, "warn", "skipped · too many refusals", give_up)
+                    publish_dashboard_update("message_skipped", account_id)
                 else:
-                    # Write it again in a different style and send it AT ONCE. Repeat until it is delivered (or the cap above).
+                    # Rewrite in a different (safer after a few tries) style and send AT ONCE. Cap above stops endless loops.
+                    safer = refused >= SAFER_AFTER_REFUSALS
                     if first_contact and row["stage"] in (None, "first_sent"):
-                        new_id = await requeue_rewritten(row, account_id)
+                        new_id = await requeue_rewritten(row, account_id, safer=safer)
                     elif row["stage"] == "intro_sent":
                         new_id = await requeue_intro(row, account_id)  # the member answered, so this conversation matters most
                     else:
                         new_id = await requeue_rephrased(row, account_id)
+                    if new_id and safer:
+                        note_ops(account_id, "info", "retry · safer wording", f"Rewrote message for {row['candidate_name']} with a safer style after {refused} refusals.")
                     if new_id and not on_hold:  # during a hold the new message waits in the queue and goes when the hold ends
                         await asyncio.sleep(random.uniform(*RETRY_PAUSE_SECONDS))
                         return await deliver(new_id)
+            else:
+                # Non-spam rejection: still keep going — the delivery loop picks the next due message.
+                pass
             return "failed"
         delivered = True
         outage_step.pop(account_id, None)  # Himalayas opens conversations again

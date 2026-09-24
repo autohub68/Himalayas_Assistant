@@ -137,10 +137,8 @@ $('server-toggle').onclick = async () => {
 $('auth').onclick = async () => { window.open(`${API}/api/auth/start?account_id=${encodeURIComponent(await accountReady)}`, '_blank'); };
 $('dashboard-tab').onclick = () => showTab('dashboard');
 $('chats-tab').onclick = () => showTab('chats');
-// The database opens as its own full-size page (new tab). window.open with a fixed name reuses that tab if it is already open.
 // One dashboard for every extension, served by the backend. It belongs to no Chrome profile.
 $('admin-link').onclick = () => { window.open('http://localhost:8765/admin/', 'hiring-admin'); };
-$('database-tab').onclick = () => { window.open(chrome.runtime.getURL('database.html'), 'hiring-database'); };
 $('settings-tab').onclick = () => showTab('settings');
 $('save-settings').onclick = async () => { const button = $('save-settings'); button.disabled = true; $('settings-result').textContent = 'Saving...'; const values = {}; settingFields.forEach((field) => { const value = $(field).value.trim(); if (value !== '') values[field] = (field.endsWith('_delay_seconds') || field === 'daily_dm_limit') ? Number(value) : value; }); try { const saved = await request('/api/settings', {method: 'PUT', body: JSON.stringify(values)}); await request('/api/account', {method: 'PUT', body: JSON.stringify({label: $('account_label').value.trim()})}); const warnings = (saved && saved.warnings) || [], errors = (saved && saved.errors) || []; $('settings-result').textContent = errors.length ? `${saved.saved && saved.saved.length ? 'Saved. ' : ''}${errors.join(' ')}` : warnings.length ? `Settings saved. Note: ${warnings.join(' ')}` : 'Settings saved.'; await loadSettings(); } catch (error) { let detail = error.message; try { detail = JSON.parse(error.message).detail || detail; } catch (parseError) { /* plain text */ } $('settings-result').textContent = `Not saved: ${detail}`; } finally { button.disabled = false; } };
 async function connectDashboardEvents() {

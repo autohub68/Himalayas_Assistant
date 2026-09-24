@@ -96,8 +96,12 @@ function automationText(account) {
 }
 function sendingText(account) {
   if (account.paused) return 'Paused';
-  const d = account.delivery;
-  return d.status === 'sending' && d.current_name ? `Sending to ${d.current_name}` : d.status === 'idle' ? 'Idle' : d.status;
+  const d = account.delivery || {};
+  if (d.status === 'sending' && d.current_name) return `Sending to ${d.current_name}`;
+  if (!d.status || d.status === 'idle') return 'Idle';
+  // Cards show a short hint only; full text lives in the operations log.
+  const hint = String(d.status).split('\n')[0].trim();
+  return hint.length > 42 ? `${hint.slice(0, 39)}…` : hint;
 }
 function dailyText(daily) {
   if (!daily || !daily.limit) return 'No limit';
@@ -176,8 +180,30 @@ async function loadOverview() {
     renderHeader(state.overview);
     renderAccounts(state.overview);
     if (state.view === 'account') { renderAccountHead(); loadAccountTab(); }
+    if (state.view === 'accounts') loadOpsLog();
   } catch (error) { markOffline(error); }
 }
+
+async function loadOpsLog() {
+  const el = $('ops-log');
+  if (!el) return;
+  try {
+    const data = await api('/api/admin/ops-log?limit=80');
+    const items = data.items || [];
+    if (!items.length) {
+      el.innerHTML = '<p class="muted">No holds, rate limits, or skips yet. Details appear here when sending hits a problem.</p>';
+      return;
+    }
+    el.innerHTML = items.map((row) => {
+      const label = row.account_label || row.account_id || 'Server';
+      const detail = row.detail || row.hint || '';
+      return `<div class="ops-row ${escapeHtml(row.level || 'info')}"><div class="ops-meta">${escapeHtml(formatDate(row.created_at))} · ${escapeHtml(row.hint || '')}</div><div class="ops-detail"><span class="ops-bot">[${escapeHtml(label)}]</span> ${escapeHtml(detail)}</div></div>`;
+    }).join('');
+  } catch (error) {
+    el.innerHTML = `<p class="muted">Could not load log: ${escapeHtml(errorText(error))}</p>`;
+  }
+}
+if ($('ops-log-refresh')) $('ops-log-refresh').onclick = loadOpsLog;
 
 // ---------- navigation ----------
 function showView(view) {
@@ -187,6 +213,7 @@ function showView(view) {
   if (view === 'settings') loadSettings();
   if (view === 'playbook') loadPlaybook();
   if (view === 'ledger') loadLedger();
+  if (view === 'accounts') loadOpsLog();
 }
 document.querySelectorAll('#main-tabs button').forEach((button) => { button.onclick = () => { closeDetail(); showView(button.dataset.view); }; });
 $('back').onclick = () => { closeDetail(); showView('accounts'); };

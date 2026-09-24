@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Himalayas Hiring Assistant",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Review candidates, draft outreach, and manage recruiting conversations.",
   "action": {
     "default_popup": "popup.html"

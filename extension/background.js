@@ -1,5 +1,5 @@
-// Single owner of the Chrome-profile account id. Popup and database pages ask for
-// it; they must not mint their own, or two IDs race into the Control center.
+// Single owner of the Chrome-profile account id. The popup asks for it; it must not
+// mint its own, or two IDs race into the Control center.
 const API = 'http://127.0.0.1:8765';
 const ALARM = 'him-heartbeat';
 

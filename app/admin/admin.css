@@ -107,6 +107,13 @@ label{display:block;margin:10px 0 4px;color:var(--muted);font:10px 'DM Mono',mon
 .facts a{color:var(--lime)}
 .activity{display:grid;gap:5px;max-height:360px;overflow:auto}
 .act-row{display:grid;grid-template-columns:1fr auto auto;gap:10px;align-items:center;padding:8px 10px;border:1px solid var(--line);border-radius:6px;background:var(--panel-2);font-size:12px}
+.ops-log-panel{margin-top:18px}
+.ops-log{display:grid;gap:6px;max-height:320px;overflow:auto;font-size:12px}
+.ops-row{padding:8px 10px;border:1px solid var(--line);border-radius:6px;background:var(--panel-2);line-height:1.45}
+.ops-row .ops-meta{color:var(--dim);font:10px 'DM Mono',monospace;margin-bottom:3px}
+.ops-row .ops-bot{color:var(--lime);font-weight:700}
+.ops-row.warn .ops-bot{color:var(--orange)}
+.ops-row .ops-detail{color:var(--text);overflow-wrap:anywhere}
 .act-row small{color:var(--dim)}
 
 /* members table */

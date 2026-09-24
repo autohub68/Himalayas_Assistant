@@ -123,6 +123,15 @@ def init_db() -> None:
                 code_verifier TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS ops_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id TEXT NOT NULL DEFAULT '',
+                account_label TEXT NOT NULL DEFAULT '',
+                level TEXT NOT NULL DEFAULT 'info',
+                hint TEXT NOT NULL DEFAULT '',
+                detail TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            );
             """
             + oauth_tokens_ddl("oauth_tokens")
         )
@@ -132,6 +141,7 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_messages_ready ON messages(status, send_after);
             CREATE INDEX IF NOT EXISTS idx_messages_account ON messages(account_id, status);
             CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_external_id ON messages(external_id) WHERE external_id IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_ops_log_created ON ops_log(created_at DESC);
             """
         )
 

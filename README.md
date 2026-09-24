@@ -11,7 +11,7 @@ A bot that messages talent on Himalayas for Ocean Park Asset and runs each membe
 3. **Check before every first message:** the shared Supabase ledger (never message a member twice), and Himalayas itself (no earlier company message). After sending, the bot reads the conversation back. A message counts as sent only if the text is really there.
 4. **Watch for replies** every 30 seconds. A reply gets the next step of the chat 1 to 2 minutes later. Every member is contacted. Nobody is skipped.
 5. **Never stop:** a message the spam filter refuses is rewritten in a new style and resent at once. If Himalayas itself cannot open conversations, messages stay queued and are retried with growing pauses. Automation only ends with the Stop button, and it survives restarts.
-6. **Dashboards:** the extension popup (chats, newest reply on top), the Database page (every member with status), and the Control center (all Chrome profiles, playbook import, "Verify with Himalayas").
+6. **Dashboards:** the extension popup (chats, newest reply on top) and the Control center (all Chrome profiles, Supabase ledger, playbook import, "Verify with Himalayas").
 
 ## Chat process
 
