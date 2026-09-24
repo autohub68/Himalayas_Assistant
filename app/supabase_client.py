@@ -144,13 +144,24 @@ class SupabaseLedger:
             return set()
 
     @staticmethod
+    def ledger_category(candidate: dict) -> str:
+        """Position title for the shared ledger. Prefer the suggested role over developer/non_developer."""
+        role = (candidate.get("suggested_role") or "").strip()
+        if role:
+            return role
+        raw = (candidate.get("category") or "").strip()
+        if raw and raw.lower() not in {"developer", "non_developer", "non-developer", "business", "unknown"}:
+            return raw
+        return raw or "unknown"
+
+    @staticmethod
     def base_payload(candidate: dict, message_id: int | None, body: str) -> dict:
         payload = {
             "talent_slug": candidate["external_id"],
             "candidate_name": candidate["name"],
             "profile_url": candidate.get("profile_url", ""),
             "summary": candidate.get("summary", ""),
-            "category": candidate.get("category", "unknown"),
+            "category": SupabaseLedger.ledger_category(candidate),
             "stack": candidate.get("stack", []),
             "message_id": message_id,
             "message_body": body,

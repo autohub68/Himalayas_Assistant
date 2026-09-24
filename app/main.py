@@ -892,8 +892,10 @@ async def queue_campaign(account_id: str, request: CampaignRequest) -> dict:
 
     queued_notes = []
     for candidate, first in generated:
+        candidate["suggested_role"] = first["role"]
+        candidate["category"] = chat.category_for(first["role"])
         with connection() as conn:
-            conn.execute("UPDATE candidates SET suggested_role=?, category=? WHERE id=?", (first["role"], chat.category_for(first["role"]), candidate["id"]))
+            conn.execute("UPDATE candidates SET suggested_role=?, category=? WHERE id=?", (first["role"], candidate["category"], candidate["id"]))
             message_id = conn.execute("INSERT INTO messages (account_id, candidate_id, direction, body, status, send_after, stage, created_at) VALUES (?, ?, 'outbound', ?, 'scheduled', ?, ?, ?)",
                                       (account_id, candidate["id"], first["message"], next_send_at.isoformat(), chat.FIRST, utc_now())).lastrowid
         queued_notes.append((candidate, message_id, first["message"]))
@@ -1854,7 +1856,8 @@ async def retry_message(message_id: int, account: Account) -> dict:
     with connection() as conn:
         row = conn.execute(
             """SELECT m.id, m.candidate_id, m.body, c.external_id AS candidate_external_id, c.name AS candidate_name, c.profile_url AS candidate_profile_url,
-            c.summary AS candidate_summary, c.category AS candidate_category, c.stack_json AS candidate_stack_json, c.country AS candidate_country
+            c.summary AS candidate_summary, c.category AS candidate_category, c.stack_json AS candidate_stack_json, c.country AS candidate_country,
+            c.suggested_role AS candidate_suggested_role
             FROM messages m JOIN candidates c ON c.id=m.candidate_id WHERE m.id=?""",
             (message_id,),
         ).fetchone()
@@ -2287,7 +2290,8 @@ async def deliver(message_id: int) -> str:
         row = conn.execute(
             """SELECT m.*, c.external_id AS candidate_external_id, c.name AS candidate_name,
             c.profile_url AS candidate_profile_url, c.summary AS candidate_summary,
-            c.category AS candidate_category, c.stack_json AS candidate_stack_json, c.country AS candidate_country
+            c.category AS candidate_category, c.stack_json AS candidate_stack_json, c.country AS candidate_country,
+            c.suggested_role AS candidate_suggested_role
             FROM messages m JOIN candidates c ON c.id=m.candidate_id WHERE m.id=?""",
             (message_id,),
         ).fetchone()
@@ -2470,6 +2474,7 @@ async def deliver(message_id: int) -> str:
             "category": row["candidate_category"],
             "stack": json.loads(row["candidate_stack_json"]),
             "country": row["candidate_country"] or "",
+            "suggested_role": row["candidate_suggested_role"] or "",
         }
         candidate["sent_at"] = utc_now()
         with connection() as conn:
@@ -2507,10 +2512,12 @@ async def deliver(message_id: int) -> str:
 
 def ledger_candidate(row) -> dict:
     """Candidate fields for the ledger, from a joined message row (see deliver)."""
+    keys = row.keys()
     return {
         "external_id": row["candidate_external_id"], "name": row["candidate_name"], "profile_url": row["candidate_profile_url"],
         "summary": row["candidate_summary"], "category": row["candidate_category"], "stack": json.loads(row["candidate_stack_json"]),
-        "country": (row["candidate_country"] if "candidate_country" in row.keys() else "") or "",
+        "country": (row["candidate_country"] if "candidate_country" in keys else "") or "",
+        "suggested_role": (row["candidate_suggested_role"] if "candidate_suggested_role" in keys else "") or "",
     }
 
 
