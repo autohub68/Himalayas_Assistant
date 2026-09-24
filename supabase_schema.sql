@@ -32,6 +32,7 @@ alter table public.outreach_contacts add column if not exists error text;
 alter table public.outreach_contacts add column if not exists account_id text;
 alter table public.outreach_contacts add column if not exists account_label text;
 alter table public.outreach_contacts add column if not exists updated_at timestamptz not null default now();
+alter table public.outreach_contacts add column if not exists country text not null default '';
 -- Queued and failed rows have no send time yet.
 alter table public.outreach_contacts alter column sent_at drop not null;
 alter table public.outreach_contacts alter column sent_at drop default;

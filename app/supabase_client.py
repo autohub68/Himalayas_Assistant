@@ -145,7 +145,7 @@ class SupabaseLedger:
 
     @staticmethod
     def base_payload(candidate: dict, message_id: int | None, body: str) -> dict:
-        return {
+        payload = {
             "talent_slug": candidate["external_id"],
             "candidate_name": candidate["name"],
             "profile_url": candidate.get("profile_url", ""),
@@ -155,6 +155,89 @@ class SupabaseLedger:
             "message_id": message_id,
             "message_body": body,
         }
+        country = (candidate.get("country") or "").strip()
+        if country:
+            payload["country"] = country
+        return payload
+
+    async def list_contacts(
+        self,
+        *,
+        status: str | None = None,
+        q: str | None = None,
+        offset: int = 0,
+        limit: int = 50,
+        account_id: str | None = None,
+    ) -> dict:
+        """Browse the shared ledger. Returns {total, offset, limit, contacts}."""
+        limit = max(1, min(limit, 200))
+        offset = max(0, offset)
+        needle = (q or "").replace(",", " ").replace(".", " ").strip()
+
+        def params(with_country: bool) -> dict[str, str]:
+            select = "id,talent_slug,candidate_name,profile_url,summary,category,stack,status,error,account_id,account_label,message_id,message_body,sent_at,created_at,updated_at"
+            if with_country:
+                select += ",country"
+            out: dict[str, str] = {
+                "select": select,
+                "order": "updated_at.desc.nullslast,sent_at.desc.nullslast,id.desc",
+                "limit": str(limit),
+                "offset": str(offset),
+            }
+            if status:
+                out["status"] = f"eq.{status}"
+            if account_id:
+                out["account_id"] = f"eq.{account_id}"
+            if needle:
+                fields = ["candidate_name", "talent_slug", "account_label"]
+                if with_country:
+                    fields.append("country")
+                out["or"] = "(" + ",".join(f"{field}.ilike.*{needle}*" for field in fields) + ")"
+            return out
+
+        headers = {**self.headers, "Prefer": "count=exact"}
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.get(self.endpoint, headers=headers, params=params(True))
+                if response.is_error and "country" in response.text:
+                    response = await client.get(self.endpoint, headers=headers, params=params(False))
+        except httpx.HTTPError as exc:
+            raise SupabaseError(f"Could not reach Supabase: {type(exc).__name__}") from exc
+        if response.is_error:
+            raise SupabaseError(f"Ledger list failed ({response.status_code}): {response.text}")
+        total = None
+        content_range = response.headers.get("content-range") or ""
+        if "/" in content_range:
+            try:
+                total = int(content_range.rsplit("/", 1)[-1])
+            except ValueError:
+                total = None
+        rows = response.json()
+        return {"total": total if total is not None else len(rows), "offset": offset, "limit": limit, "contacts": rows}
+
+    async def get_contact(self, talent_slug: str) -> dict | None:
+        """One ledger row by talent slug, or None."""
+        select_full = "id,talent_slug,candidate_name,profile_url,summary,category,stack,status,error,account_id,account_label,message_id,message_body,sent_at,created_at,updated_at,country"
+        select_basic = select_full.replace(",country", "")
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                response = await client.get(
+                    self.endpoint,
+                    headers=self.headers,
+                    params={"talent_slug": f"eq.{talent_slug}", "select": select_full, "limit": "1"},
+                )
+                if response.is_error and "country" in response.text:
+                    response = await client.get(
+                        self.endpoint,
+                        headers=self.headers,
+                        params={"talent_slug": f"eq.{talent_slug}", "select": select_basic, "limit": "1"},
+                    )
+        except httpx.HTTPError as exc:
+            raise SupabaseError(f"Could not reach Supabase: {type(exc).__name__}") from exc
+        if response.is_error:
+            raise SupabaseError(f"Ledger lookup failed ({response.status_code}): {response.text}")
+        rows = response.json()
+        return rows[0] if rows else None
 
     async def record_contact(self, candidate: dict, message_id: int, body: str) -> None:
         """The first message was sent. Overwrites a queued or failed row for the same member."""

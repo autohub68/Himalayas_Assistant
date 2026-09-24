@@ -44,6 +44,7 @@ def candidates_ddl(table: str) -> str:
             github_email TEXT,
             github_invited_at TEXT,
             suggested_role TEXT,
+            country TEXT DEFAULT '',
             UNIQUE(account_id, external_id)
         );"""
 
@@ -171,6 +172,8 @@ def migrate(conn: sqlite3.Connection) -> None:
 
     if "suggested_role" not in columns(conn, "candidates"):
         conn.execute("ALTER TABLE candidates ADD COLUMN suggested_role TEXT")
+    if "country" not in columns(conn, "candidates"):
+        conn.execute("ALTER TABLE candidates ADD COLUMN country TEXT DEFAULT ''")
 
     if "needs_reconnect" not in columns(conn, "oauth_tokens") and "id" not in columns(conn, "oauth_tokens"):
         conn.execute("ALTER TABLE oauth_tokens ADD COLUMN needs_reconnect INTEGER NOT NULL DEFAULT 0")

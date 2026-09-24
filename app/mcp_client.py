@@ -11,6 +11,7 @@ import httpx
 
 from .config import settings
 from .db import LEGACY_ACCOUNT, connection, get_state, set_state, utc_now
+from .profile_parse import extract_country
 
 
 def _challenge(verifier: str) -> str:
@@ -308,7 +309,9 @@ class HimalayasMCP:
                 continue
             lines = [line.strip() for line in block.splitlines() if line.strip()]
             summary = next((line for line in lines if "💡" in line), "").replace("💡", "").strip()
-            role = next((line for line in lines if line.startswith("💼")), "").replace("💼", "").strip()
+            role = next((line for line in lines if line.startswith("💼") or "💼" in line), "").replace("💼", "").strip()
+            location_line = next((line for line in lines if "📍" in line or line.startswith("🌍") or line.startswith("🌎") or line.startswith("🌏")), "")
+            country = extract_country(location_line, block)
             candidates.append({
                 "talent_slug": slug_match.group(1),
                 "name": name_match.group(1).strip(),
@@ -316,6 +319,8 @@ class HimalayasMCP:
                 "profile_url": f"https://himalayas.app/@{slug_match.group(1)}",
                 "stack": [],
                 "page": page,
+                "country": country,
+                "location": location_line.replace("📍", "").strip() if location_line else "",
             })
         return candidates
 

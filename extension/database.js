@@ -62,7 +62,7 @@ function renderChips() {
 }
 function visibleMembers() {
   const query = state.query.toLowerCase();
-  const items = state.members.filter((member) => (!state.status || member.outreach_status === state.status) && (!query || member.name.toLowerCase().includes(query)));
+  const items = state.members.filter((member) => (!state.status || member.outreach_status === state.status) && (!query || member.name.toLowerCase().includes(query) || (member.country || '').toLowerCase().includes(query) || (member.role || '').toLowerCase().includes(query)));
   const key = state.sortKey, direction = state.sortDir === 'asc' ? 1 : -1;
   return items.sort((a, b) => {
     const left = a[key] ?? '', right = b[key] ?? '';
@@ -94,7 +94,7 @@ function rowHtml(member) {
   const followUpFailed = member.failed_message_id && member.outreach_status !== 'failed';
   const problem = member.outreach_status === 'failed' || member.outreach_status === 'skipped' ? member.outreach_error : followUpFailed ? member.failed_error : null;
   return `<tr data-id="${member.id}"><td><span class="name">${escapeHtml(member.name)}</span><span class="sub">${escapeHtml(member.category === 'developer' ? 'Developer' : 'Business')}</span>${problem ? `<span class="err">${escapeHtml(problem)}</span>` : ''}</td>` +
-    `<td>${escapeHtml(member.role || '—')}</td><td>${tag(member.outreach_status)}${followUpFailed ? ' ' + tag('failed', 'Reply failed') : ''}</td><td>${himalayasCell(member)}</td>` +
+    `<td>${escapeHtml(member.country || '—')}</td><td>${escapeHtml(member.role || '—')}</td><td>${tag(member.outreach_status)}${followUpFailed ? ' ' + tag('failed', 'Reply failed') : ''}</td><td>${himalayasCell(member)}</td>` +
     `<td>${escapeHtml(stageLabel(member.stage))}</td><td class="num">${member.replies}</td><td>${githubCell(member)}</td><td>${escapeHtml(formatDate(member.last_activity))}</td>` +
     `<td>${retryId ? `<button class="retry" data-retry="${retryId}">Retry</button>` : ''}</td></tr>`;
 }
@@ -104,7 +104,7 @@ function renderMembers() {
   const pages = Math.max(1, Math.ceil(items.length / state.pageSize));
   state.page = Math.min(state.page, pages - 1);
   const slice = items.slice(state.page * state.pageSize, (state.page + 1) * state.pageSize);
-  $('rows').innerHTML = slice.length ? slice.map(rowHtml).join('') : `<tr><td colspan="9" class="empty">${state.members.length ? 'No members match this filter.' : 'No members yet. Members appear here after their first message is queued.'}</td></tr>`;
+  $('rows').innerHTML = slice.length ? slice.map(rowHtml).join('') : `<tr><td colspan="10" class="empty">${state.members.length ? 'No members match this filter.' : 'No members yet. Members appear here after their first message is queued.'}</td></tr>`;
   document.querySelectorAll('#members th[data-sort]').forEach((header) => { header.classList.toggle('sorted', header.dataset.sort === state.sortKey); header.classList.toggle('desc', header.dataset.sort === state.sortKey && state.sortDir === 'desc'); });
   $('pager-info').textContent = `${plural(items.length, 'member')} · page ${state.page + 1} of ${pages}${state.matched > state.members.length ? ` · showing the newest ${state.members.length} of ${state.matched}` : ''}`;
   $('prev').disabled = state.page === 0;
@@ -165,10 +165,10 @@ async function openDetail(id, keepOpen = false) {
     const data = await request(`/api/conversations/${id}`);
     const c = data.candidate;
     $('detail-name').textContent = c.name;
-    $('detail-sub').textContent = `${c.suggested_role || 'No role yet'} · ${stageLabel(c.stage)}`;
+    $('detail-sub').textContent = `${[c.country, c.suggested_role || 'No role yet', stageLabel(c.stage)].filter(Boolean).join(' · ')}`;
     const profile = c.profile_url ? `<a href="${escapeHtml(c.profile_url)}" target="_blank" rel="noopener">${escapeHtml(c.profile_url)}</a>` : '—';
     $('detail-body').innerHTML =
-      `<dl class="facts"><dt>Category</dt><dd>${escapeHtml(c.category === 'developer' ? 'Developer' : 'Business')}</dd><dt>Profile</dt><dd>${profile}</dd><dt>GitHub</dt><dd>${escapeHtml(inviteText(c))}</dd>${c.github_email ? `<dt>Email</dt><dd>${escapeHtml(c.github_email)}</dd>` : ''}<dt>Messages</dt><dd>${data.messages.length}</dd></dl>` +
+      `<dl class="facts"><dt>Country</dt><dd>${escapeHtml(c.country || '—')}</dd><dt>Category</dt><dd>${escapeHtml(c.category === 'developer' ? 'Developer' : 'Business')}</dd><dt>Profile</dt><dd>${profile}</dd><dt>GitHub</dt><dd>${escapeHtml(inviteText(c))}</dd>${c.github_email ? `<dt>Email</dt><dd>${escapeHtml(c.github_email)}</dd>` : ''}<dt>Messages</dt><dd>${data.messages.length}</dd></dl>` +
       (c.summary ? `<div><p class="group">PROFILE</p><div class="profile">${escapeHtml(c.summary.slice(0, 1500))}</div></div>` : '') +
       `<div><p class="group">CONVERSATION</p><div class="thread">${data.messages.length ? data.messages.map(bubbleHtml).join('') : '<p class="muted">No messages.</p>'}</div></div>` +
       `<div id="live-section" hidden><p class="group">CHECK ON HIMALAYAS (LIVE)</p><div id="live-thread" class="thread"></div></div>`;
@@ -191,8 +191,8 @@ $('next').onclick = () => { state.page += 1; renderMembers(); };
 
 function csvCell(value) { const text = String(value ?? ''); return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text; }
 function membersCsv(items) {
-  const header = ['name', 'suggested_role', 'category', 'outreach_status', 'chat_step', 'replies', 'github_username', 'last_activity', 'error'];
-  const lines = items.map((m) => [m.name, m.role, m.category, m.outreach_status, stageLabel(m.stage), m.replies, m.github_username, m.last_activity, m.outreach_error || m.failed_error].map(csvCell).join(','));
+  const header = ['name', 'country', 'suggested_role', 'category', 'outreach_status', 'chat_step', 'replies', 'github_username', 'last_activity', 'error'];
+  const lines = items.map((m) => [m.name, m.country, m.role, m.category, m.outreach_status, stageLabel(m.stage), m.replies, m.github_username, m.last_activity, m.outreach_error || m.failed_error].map(csvCell).join(','));
   return [header.join(','), ...lines].join('\n');
 }
 $('export').onclick = () => {

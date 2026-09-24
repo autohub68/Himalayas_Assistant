@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 
 from . import chat, playbook, prompted
 from .ai import classify, write_first_message
+from .profile_parse import contact_blocked_reason, KOREA_SKIP_REASON
 from .config import settings
 from .github import settings_ready
 from .db import ACCOUNT_ID_PATTERN, backup_database, connection, ensure_account, get_state, init_db, known_accounts, set_state, utc_now, vacuum
@@ -383,6 +384,7 @@ async def startup() -> None:
     compact_scheduled_queue()
     restore_cooldowns()
     upgrade_pending_intros()
+    skip_korea_queued_messages()
     asyncio.create_task(supervised("delivery", delivery_loop))
     asyncio.create_task(supervised("himalayas check", himalayas_check_loop))
     reply_monitor_task = asyncio.create_task(supervised("reply monitor", reply_monitor_loop))
@@ -647,10 +649,15 @@ async def import_candidates(account_id: str, page: int) -> dict:
         semaphore = asyncio.Semaphore(settings.profile_fetch_concurrency)
 
         async def enrich(item: dict) -> dict:
+            from .profile_parse import extract_country
+
             async with semaphore:
                 profile = await client.get_talent_profile(item["talent_slug"])
             item["profile"] = profile
             item["summary"] = f"{item.get('summary', '')}\n{profile}"[:12000]
+            country = extract_country(item.get("country") or "", item.get("location") or "", profile)
+            if country:
+                item["country"] = country
             return item
 
         imported = await asyncio.gather(*(enrich(item) for item in imported))
@@ -661,19 +668,22 @@ async def import_candidates(account_id: str, page: int) -> dict:
             stack = item.get("stack", item.get("skills", []))
             summary = item.get("summary", item.get("bio", ""))
             category = classify(stack, summary)
+            country = (item.get("country") or "").strip()
             now = utc_now()
             candidate_slug = item.get("talent_slug", item.get("slug", item.get("id", "")))
             if not candidate_slug:
                 continue
             conn.execute(
-                """INSERT INTO candidates (account_id, external_id, name, profile_url, summary, stack_json, category, source_json, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """INSERT INTO candidates (account_id, external_id, name, profile_url, summary, stack_json, category, source_json, country, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(account_id, external_id) DO UPDATE SET name=excluded.name, profile_url=excluded.profile_url,
                 summary=excluded.summary, stack_json=excluded.stack_json,
                 category=CASE WHEN candidates.suggested_role IS NOT NULL THEN candidates.category ELSE excluded.category END,
-                source_json=excluded.source_json, updated_at=excluded.updated_at""",
+                source_json=excluded.source_json,
+                country=CASE WHEN excluded.country != '' THEN excluded.country ELSE candidates.country END,
+                updated_at=excluded.updated_at""",
                 (account_id, str(candidate_slug), item.get("name", "Candidate"), item.get("profile_url", ""), summary,
-                 json.dumps(stack), category, json.dumps(item), now, now),
+                 json.dumps(stack), category, json.dumps(item), country, now, now),
             )
     publish_dashboard_update("candidates_synced", account_id)
     return {"imported": len(listed), "fresh": len(imported), "already_contacted": len(listed) - len(imported)}
@@ -711,6 +721,7 @@ async def automatic_campaign(account_id: str, page: int = 1) -> None:
     state = automation_state(account_id)
     state.update({"running": True, "page": page, "status": "syncing", "queued": 0})
     remember_automation(account_id, page)
+    skip_korea_queued_messages(account_id)
     errors_in_a_row = 0
     try:
         while True:
@@ -794,9 +805,36 @@ async def stop_automation(account: Account) -> dict:
     return automation_state(account)
 
 
+def skip_korea_queued_messages(account_id: str | None = None) -> int:
+    """Cancel waiting first messages to Korea-based members. Returns how many were skipped."""
+    with connection() as conn:
+        if account_id:
+            rows = conn.execute(
+                """SELECT m.id, c.country, c.summary FROM messages m
+                JOIN candidates c ON c.id=m.candidate_id
+                WHERE m.account_id=? AND m.direction='outbound' AND m.status IN ('scheduled', 'approved', 'queued')
+                AND NOT EXISTS (SELECT 1 FROM messages s WHERE s.candidate_id=m.candidate_id AND s.direction='outbound' AND s.status='sent')""",
+                (account_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT m.id, c.country, c.summary FROM messages m
+                JOIN candidates c ON c.id=m.candidate_id
+                WHERE m.direction='outbound' AND m.status IN ('scheduled', 'approved', 'queued')
+                AND NOT EXISTS (SELECT 1 FROM messages s WHERE s.candidate_id=m.candidate_id AND s.direction='outbound' AND s.status='sent')"""
+            ).fetchall()
+        skipped = 0
+        for row in rows:
+            if contact_blocked_reason({"country": row["country"] or "", "summary": row["summary"] or ""}):
+                conn.execute("UPDATE messages SET status='skipped', error=? WHERE id=?", (KOREA_SKIP_REASON, row["id"]))
+                skipped += 1
+    return skipped
+
+
 async def queue_campaign(account_id: str, request: CampaignRequest) -> dict:
     created = 0
     skipped = 0
+    skipped += skip_korea_queued_messages(account_id)
     # Every new first message is due now. The gap between first messages is enforced when they are sent, in the order they were queued.
     next_send_at = datetime.now(timezone.utc)
     if request.page is not None:
@@ -819,6 +857,9 @@ async def queue_campaign(account_id: str, request: CampaignRequest) -> dict:
             # Himalayas cannot reopen this member's conversation. Trying again only adds another failure, so wait for Himalayas to fix it.
             unreachable = conn.execute("SELECT 1 FROM messages WHERE candidate_id=? AND direction='outbound' AND status='failed' AND (error LIKE 'Himalayas cannot reopen%' OR error LIKE 'Gave up:%') LIMIT 1", (candidate["id"],)).fetchone()
         if already_contacted or unreachable:
+            skipped += 1
+            continue
+        if contact_blocked_reason(candidate):
             skipped += 1
             continue
         eligible_rows.append(candidate)
@@ -1011,9 +1052,10 @@ async def mark_conversation_read(candidate_id: int, account: Account) -> dict:
 
 LEDGER_COLUMNS = [
     ("id", "bigint", True), ("talent_slug", "text", False), ("candidate_name", "text", False), ("profile_url", "text", False),
-    ("summary", "text", False), ("category", "text", False), ("stack", "jsonb", False), ("message_id", "bigint", False),
-    ("message_body", "text", False), ("status", "text", False), ("error", "text", False), ("account_id", "text", False),
-    ("account_label", "text", False), ("sent_at", "timestamptz", False), ("created_at", "timestamptz", False), ("updated_at", "timestamptz", False),
+    ("summary", "text", False), ("category", "text", False), ("stack", "jsonb", False), ("country", "text", False),
+    ("message_id", "bigint", False), ("message_body", "text", False), ("status", "text", False), ("error", "text", False),
+    ("account_id", "text", False), ("account_label", "text", False), ("sent_at", "timestamptz", False),
+    ("created_at", "timestamptz", False), ("updated_at", "timestamptz", False),
 ]
 TABLE_INFO = [
     ("accounts", "Chrome profiles that use this server"),
@@ -1058,7 +1100,10 @@ def member_rows(account_id: str) -> list[dict]:
     """One row for every member who was reached (has at least one outbound message), with the outreach status."""
     with connection() as conn:
         checks = {row["candidate_id"]: row for row in conn.execute("SELECT * FROM himalayas_check WHERE account_id=?", (account_id,))}
-        candidates = conn.execute("SELECT id, name, external_id, profile_url, suggested_role, category, github_username, github_invited_at FROM candidates WHERE account_id=?", (account_id,)).fetchall()
+        candidates = conn.execute(
+            "SELECT id, name, external_id, profile_url, suggested_role, category, country, github_username, github_invited_at FROM candidates WHERE account_id=?",
+            (account_id,),
+        ).fetchall()
         messages = conn.execute(
             """SELECT m.id, m.candidate_id, m.direction, m.status, m.stage, m.error, m.sent_at, m.created_at, m.read_at, m.body
             FROM messages m JOIN candidates c ON c.id=m.candidate_id
@@ -1086,6 +1131,7 @@ def member_rows(account_id: str) -> list[dict]:
         failed = next((m for m in reversed(outbound) if m["status"] == "failed"), None)
         members.append({
             "id": candidate["id"], "name": candidate["name"], "role": candidate["suggested_role"], "category": candidate["category"],
+            "country": candidate["country"] or "",
             "outreach_status": outreach["status"], "outreach_error": outreach["error"], "outreach_message_id": outreach["id"],
             "outreach_sent_at": outreach["sent_at"], "last_status": outbound[-1]["status"], "stage": stage,
             "replies": len(inbound), "unread_count": unread_count,
@@ -1120,7 +1166,8 @@ async def db_members(account: Account, status: str | None = None, q: str | None 
     elif status:
         members = [m for m in members if m["outreach_status"] == status]
     if q:
-        members = [m for m in members if q.lower() in m["name"].lower()]
+        needle = q.lower()
+        members = [m for m in members if needle in m["name"].lower() or needle in (m.get("country") or "").lower() or needle in (m.get("role") or "").lower()]
     return {
         "summary": {**summary, "total": sum(summary.values()), "unread": unread_total},
         "members": members[:limit],
@@ -1324,6 +1371,52 @@ async def import_playbook(body: PlaybookFile) -> dict:
 async def reset_playbook() -> dict:
     playbook.reset_active()
     return playbook_status()
+
+
+@app.get("/api/admin/ledger")
+async def admin_ledger(
+    status: str | None = None,
+    q: str | None = None,
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=200),
+    account_id: str | None = None,
+) -> dict:
+    """Browse members stored in the shared Supabase contact ledger."""
+    if not settings.supabase_url or not settings.supabase_key:
+        raise HTTPException(status_code=503, detail="Supabase is not configured. Add the URL and key under Settings.")
+    if status and status not in {"queued", "sent", "failed"}:
+        raise HTTPException(status_code=400, detail="status must be queued, sent, or failed")
+    try:
+        return await SupabaseLedger().list_contacts(status=status, q=q, offset=offset, limit=limit, account_id=account_id)
+    except SupabaseError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/api/admin/ledger/{talent_slug}")
+async def admin_ledger_member(talent_slug: str) -> dict:
+    """One member's shared ledger row, plus any matching local profile rows."""
+    if not settings.supabase_url or not settings.supabase_key:
+        raise HTTPException(status_code=503, detail="Supabase is not configured. Add the URL and key under Settings.")
+    try:
+        contact = await SupabaseLedger().get_contact(talent_slug)
+    except SupabaseError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    if not contact:
+        raise HTTPException(status_code=404, detail="No ledger row for that member")
+    with connection() as conn:
+        local = [
+            dict(row)
+            for row in conn.execute(
+                """SELECT c.id, c.account_id, a.label AS account_label, c.name, c.country, c.suggested_role, c.category,
+                c.profile_url, c.github_username, c.github_invited_at, c.created_at, c.updated_at,
+                (SELECT COUNT(*) FROM messages m WHERE m.candidate_id=c.id AND m.direction='outbound' AND m.status='sent') AS sent,
+                (SELECT COUNT(*) FROM messages m WHERE m.candidate_id=c.id AND m.direction='inbound') AS replies
+                FROM candidates c LEFT JOIN accounts a ON a.id=c.account_id
+                WHERE c.external_id=? ORDER BY c.updated_at DESC""",
+                (talent_slug,),
+            )
+        ]
+    return {"contact": contact, "local": local}
 
 
 @app.get("/api/admin/overview")
@@ -1761,7 +1854,7 @@ async def retry_message(message_id: int, account: Account) -> dict:
     with connection() as conn:
         row = conn.execute(
             """SELECT m.id, m.candidate_id, m.body, c.external_id AS candidate_external_id, c.name AS candidate_name, c.profile_url AS candidate_profile_url,
-            c.summary AS candidate_summary, c.category AS candidate_category, c.stack_json AS candidate_stack_json
+            c.summary AS candidate_summary, c.category AS candidate_category, c.stack_json AS candidate_stack_json, c.country AS candidate_country
             FROM messages m JOIN candidates c ON c.id=m.candidate_id WHERE m.id=?""",
             (message_id,),
         ).fetchone()
@@ -2194,7 +2287,7 @@ async def deliver(message_id: int) -> str:
         row = conn.execute(
             """SELECT m.*, c.external_id AS candidate_external_id, c.name AS candidate_name,
             c.profile_url AS candidate_profile_url, c.summary AS candidate_summary,
-            c.category AS candidate_category, c.stack_json AS candidate_stack_json
+            c.category AS candidate_category, c.stack_json AS candidate_stack_json, c.country AS candidate_country
             FROM messages m JOIN candidates c ON c.id=m.candidate_id WHERE m.id=?""",
             (message_id,),
         ).fetchone()
@@ -2209,6 +2302,22 @@ async def deliver(message_id: int) -> str:
         state.update({"status": "idle", "current_id": None, "current_name": None})
         publish_dashboard_update("message_skipped", account_id)
         return "skipped"
+    blocked = contact_blocked_reason({
+        "country": row["candidate_country"] or "",
+        "summary": row["candidate_summary"] or "",
+    })
+    if blocked:
+        with connection() as conn:
+            sent_before = conn.execute(
+                "SELECT 1 FROM messages WHERE candidate_id=? AND direction='outbound' AND status='sent' AND id!=? LIMIT 1",
+                (row["candidate_id"], message_id),
+            ).fetchone()
+        if not sent_before:
+            with connection() as conn:
+                conn.execute("UPDATE messages SET status='skipped', error=? WHERE id=?", (blocked, message_id))
+            state.update({"status": "skipped", "current_id": None, "current_name": None})
+            publish_dashboard_update("message_skipped", account_id)
+            return "skipped"
     if hold_active(account_id):  # this account's Himalayas login needs attention. Do not even try.
         return hold_message(message_id, account_id, holds[account_id]["reason"])
     state["current_id"] = message_id
@@ -2360,6 +2469,7 @@ async def deliver(message_id: int) -> str:
             "summary": row["candidate_summary"],
             "category": row["candidate_category"],
             "stack": json.loads(row["candidate_stack_json"]),
+            "country": row["candidate_country"] or "",
         }
         candidate["sent_at"] = utc_now()
         with connection() as conn:
@@ -2400,6 +2510,7 @@ def ledger_candidate(row) -> dict:
     return {
         "external_id": row["candidate_external_id"], "name": row["candidate_name"], "profile_url": row["candidate_profile_url"],
         "summary": row["candidate_summary"], "category": row["candidate_category"], "stack": json.loads(row["candidate_stack_json"]),
+        "country": (row["candidate_country"] if "candidate_country" in row.keys() else "") or "",
     }
 
 

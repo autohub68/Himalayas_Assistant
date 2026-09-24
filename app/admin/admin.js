@@ -36,7 +36,8 @@ const stageLabel = (stage) => (stage ? (STAGE_LABELS[stage] || (/^step_(\d+)$/.t
 const tag = (status, label) => `<span class="tag ${escapeHtml(status)}">${escapeHtml(label || statusLabel(status))}</span>`;
 
 const state = {overview: null, view: 'accounts', accountId: null, tab: 'overview', busy: false,
-  mem: {items: [], summary: {}, matched: 0, status: '', query: '', sortKey: 'last_activity', sortDir: 'desc', page: 0, pageSize: 25, openId: null}};
+  mem: {items: [], summary: {}, matched: 0, status: '', query: '', sortKey: 'last_activity', sortDir: 'desc', page: 0, pageSize: 25, openId: null},
+  ledger: {items: [], total: 0, status: '', query: '', offset: 0, pageSize: 50, busy: false}};
 const currentAccount = () => (state.overview ? state.overview.accounts.find((account) => account.id === state.accountId) : null);
 
 function toast(message, isError = false) {
@@ -181,10 +182,11 @@ async function loadOverview() {
 // ---------- navigation ----------
 function showView(view) {
   state.view = view;
-  ['accounts', 'account', 'playbook', 'settings'].forEach((name) => { $(`view-${name}`).hidden = name !== view; });
+  ['accounts', 'account', 'ledger', 'playbook', 'settings'].forEach((name) => { $(`view-${name}`).hidden = name !== view; });
   document.querySelectorAll('#main-tabs button').forEach((button) => button.classList.toggle('active', button.dataset.view === (view === 'account' ? 'accounts' : view)));
   if (view === 'settings') loadSettings();
   if (view === 'playbook') loadPlaybook();
+  if (view === 'ledger') loadLedger();
 }
 document.querySelectorAll('#main-tabs button').forEach((button) => { button.onclick = () => { closeDetail(); showView(button.dataset.view); }; });
 $('back').onclick = () => { closeDetail(); showView('accounts'); };
@@ -273,7 +275,11 @@ function visibleMembers() {
   const filtered = m.items.filter((item) => {
     if (m.status === 'unread') return Number(item.unread_count || 0) > 0;
     if (m.status && item.outreach_status !== m.status) return false;
-    if (query && !item.name.toLowerCase().includes(query)) return false;
+    if (query && !(
+      item.name.toLowerCase().includes(query)
+      || (item.country || '').toLowerCase().includes(query)
+      || (item.role || '').toLowerCase().includes(query)
+    )) return false;
     return true;
   });
   // Keep API unread-first order unless the user chose a column sort other than the default.
@@ -309,7 +315,7 @@ function rowHtml(member) {
   const problem = member.outreach_status === 'failed' || member.outreach_status === 'skipped' ? member.outreach_error : followUpFailed ? member.failed_error : null;
   const unread = Number(member.unread_count || 0);
   const replyPreview = unread && member.last_reply ? `<span class="reply-preview">“${escapeHtml(member.last_reply)}”</span>` : '';
-  return `<tr data-id="${member.id}" class="${unread ? 'unread' : ''}"><td><span class="name">${escapeHtml(member.name)}${unread ? `<b class="row-unread">${unread}</b>` : ''}</span><span class="sub">${member.category === 'developer' ? 'Developer' : 'Business'}</span>${replyPreview}${problem ? `<span class="err">${escapeHtml(problem)}</span>` : ''}</td><td>${escapeHtml(member.role || '—')}</td><td>${tag(member.outreach_status)}${followUpFailed ? ' ' + tag('failed', 'Reply failed') : ''}${unread ? ' ' + tag('received', 'New reply') : ''}</td><td>${himalayasCell(member)}</td><td>${escapeHtml(stageLabel(member.stage))}</td><td class="num">${member.replies}${unread ? `<br><span class="sub">${unread} unread</span>` : ''}</td><td>${githubCell(member)}</td><td>${escapeHtml(formatDate(member.last_reply_at || member.last_activity))}</td><td>${retryId ? `<button class="retry" data-retry="${retryId}">Retry</button>` : ''}</td></tr>`;
+  return `<tr data-id="${member.id}" class="${unread ? 'unread' : ''}"><td><span class="name">${escapeHtml(member.name)}${unread ? `<b class="row-unread">${unread}</b>` : ''}</span><span class="sub">${member.category === 'developer' ? 'Developer' : 'Business'}</span>${replyPreview}${problem ? `<span class="err">${escapeHtml(problem)}</span>` : ''}</td><td>${escapeHtml(member.country || '—')}</td><td>${escapeHtml(member.role || '—')}</td><td>${tag(member.outreach_status)}${followUpFailed ? ' ' + tag('failed', 'Reply failed') : ''}${unread ? ' ' + tag('received', 'New reply') : ''}</td><td>${himalayasCell(member)}</td><td>${escapeHtml(stageLabel(member.stage))}</td><td class="num">${member.replies}${unread ? `<br><span class="sub">${unread} unread</span>` : ''}</td><td>${githubCell(member)}</td><td>${escapeHtml(formatDate(member.last_reply_at || member.last_activity))}</td><td>${retryId ? `<button class="retry" data-retry="${retryId}">Retry</button>` : ''}</td></tr>`;
 }
 function renderMembers() {
   renderChips();
@@ -318,7 +324,7 @@ function renderMembers() {
   const slice = items.slice(m.page * m.pageSize, (m.page + 1) * m.pageSize);
   const unread = m.items.reduce((total, item) => total + Number(item.unread_count || 0), 0);
   updateUnreadBadge(unread);
-  $('rows').innerHTML = slice.length ? slice.map(rowHtml).join('') : `<tr><td colspan="9" class="empty">${m.items.length ? 'No members match this filter.' : 'No members yet.'}</td></tr>`;
+  $('rows').innerHTML = slice.length ? slice.map(rowHtml).join('') : `<tr><td colspan="10" class="empty">${m.items.length ? 'No members match this filter.' : 'No members yet.'}</td></tr>`;
   document.querySelectorAll('#members th[data-sort]').forEach((header) => { header.classList.toggle('sorted', header.dataset.sort === m.sortKey); header.classList.toggle('desc', header.dataset.sort === m.sortKey && m.sortDir === 'desc'); });
   $('pager-info').textContent = `${plural(items.length, 'member')} · page ${m.page + 1} of ${pages}${m.matched > m.items.length ? ` · showing the newest ${m.items.length} of ${m.matched}` : ''}${unread ? ` · ${plural(unread, 'unread reply')}` : ''}`;
   $('prev').disabled = m.page === 0; $('next').disabled = m.page >= pages - 1;
@@ -352,8 +358,8 @@ $('prev').onclick = () => { state.mem.page -= 1; renderMembers(); };
 $('next').onclick = () => { state.mem.page += 1; renderMembers(); };
 const csvCell = (value) => { const text = String(value ?? ''); return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text; };
 function membersCsv(items) {
-  const lines = items.map((m) => [m.name, m.role, m.category, m.outreach_status, stageLabel(m.stage), m.replies, m.github_username, m.last_activity, m.outreach_error || m.failed_error].map(csvCell).join(','));
-  return [['name', 'suggested_role', 'category', 'outreach_status', 'chat_step', 'replies', 'github_username', 'last_activity', 'error'].join(','), ...lines].join('\n');
+  const lines = items.map((m) => [m.name, m.country, m.role, m.category, m.outreach_status, stageLabel(m.stage), m.replies, m.github_username, m.last_activity, m.outreach_error || m.failed_error].map(csvCell).join(','));
+  return [['name', 'country', 'suggested_role', 'category', 'outreach_status', 'chat_step', 'replies', 'github_username', 'last_activity', 'error'].join(','), ...lines].join('\n');
 }
 $('verify').onclick = async () => {
   const button = $('verify'), out = $('verify-result');
@@ -431,10 +437,10 @@ async function openDetail(id, keepOpen = false) {
     await api(`/api/conversations/${id}/read`, {method: 'POST'}, state.accountId);
     const data = await api(`/api/conversations/${id}`, {}, state.accountId), c = data.candidate;
     $('detail-name').textContent = c.name;
-    $('detail-sub').textContent = `${c.suggested_role || 'No role yet'} · ${stageLabel(c.stage)}`;
+    $('detail-sub').textContent = `${[c.country, c.suggested_role || 'No role yet', stageLabel(c.stage)].filter(Boolean).join(' · ')}`;
     const profile = c.profile_url ? `<a href="${escapeHtml(c.profile_url)}" target="_blank" rel="noopener">${escapeHtml(c.profile_url)}</a>` : '—';
     $('detail-body').innerHTML =
-      `<dl class="facts"><dt>Category</dt><dd>${c.category === 'developer' ? 'Developer' : 'Business'}</dd><dt>Profile</dt><dd>${profile}</dd><dt>GitHub</dt><dd>${escapeHtml(inviteText(c))}</dd>${c.github_email ? `<dt>Email</dt><dd>${escapeHtml(c.github_email)}</dd>` : ''}<dt>Messages</dt><dd>${data.messages.length}</dd></dl>` +
+      `<dl class="facts"><dt>Country</dt><dd>${escapeHtml(c.country || '—')}</dd><dt>Category</dt><dd>${c.category === 'developer' ? 'Developer' : 'Business'}</dd><dt>Profile</dt><dd>${profile}</dd><dt>GitHub</dt><dd>${escapeHtml(inviteText(c))}</dd>${c.github_email ? `<dt>Email</dt><dd>${escapeHtml(c.github_email)}</dd>` : ''}<dt>Messages</dt><dd>${data.messages.length}</dd></dl>` +
       (c.summary ? `<div><p class="group">PROFILE</p><div class="profile">${escapeHtml(c.summary.slice(0, 1500))}</div></div>` : '') +
       `<div><p class="group">CONVERSATION</p><div class="thread">${data.messages.length ? data.messages.map(bubbleHtml).join('') : '<p class="muted">No messages.</p>'}</div></div>` +
       `<div id="live-section" hidden><p class="group">CHECK ON HIMALAYAS (LIVE)</p><div id="live-thread" class="thread"></div></div>`;
@@ -531,6 +537,90 @@ function connectAdminEvents() {
   };
 }
 connectAdminEvents();
+
+
+// ---------- shared Supabase ledger ----------
+function ledgerChip(status, label) {
+  const active = state.ledger.status === status;
+  return `<button type="button" class="chip${active ? ' active' : ''}" data-ledger-status="${escapeHtml(status)}">${escapeHtml(label)}</button>`;
+}
+function renderLedgerChips() {
+  $('ledger-chips').innerHTML = ledgerChip('', 'All') + ledgerChip('sent', 'Sent') + ledgerChip('queued', 'Queued') + ledgerChip('failed', 'Failed');
+  $('ledger-chips').querySelectorAll('button').forEach((button) => {
+    button.onclick = () => { state.ledger.status = button.dataset.ledgerStatus; state.ledger.offset = 0; loadLedger(); };
+  });
+}
+function ledgerRow(contact) {
+  const profile = contact.profile_url
+    ? `<a href="${escapeHtml(contact.profile_url)}" target="_blank" rel="noopener">${escapeHtml(contact.talent_slug || 'profile')}</a>`
+    : escapeHtml(contact.talent_slug || '—');
+  const when = contact.updated_at || contact.sent_at || contact.created_at || '';
+  return `<tr data-slug="${escapeHtml(contact.talent_slug || '')}"><td><span class="name">${escapeHtml(contact.candidate_name || '—')}</span><span class="sub">${escapeHtml(contact.account_label || contact.account_id || '—')}</span></td><td>${escapeHtml(contact.country || '—')}</td><td>${tag(contact.status || 'sent')}</td><td>${profile}</td><td>${escapeHtml(contact.category || '—')}</td><td>${escapeHtml(formatDate(when))}</td></tr>`;
+}
+function renderLedger() {
+  renderLedgerChips();
+  const L = state.ledger;
+  $('ledger-rows').innerHTML = L.items.length ? L.items.map(ledgerRow).join('') : `<tr><td colspan="6" class="empty">${L.busy ? 'Loading…' : 'No ledger rows match.'}</td></tr>`;
+  const page = Math.floor(L.offset / L.pageSize) + 1;
+  const pages = Math.max(1, Math.ceil((L.total || 0) / L.pageSize));
+  $('ledger-pager-info').textContent = `${Number(L.total || 0).toLocaleString()} member${L.total === 1 ? '' : 's'} · page ${page} of ${pages}`;
+  $('ledger-prev').disabled = L.offset <= 0 || L.busy;
+  $('ledger-next').disabled = L.offset + L.pageSize >= L.total || L.busy;
+  $('ledger-rows').querySelectorAll('tr[data-slug]').forEach((row) => {
+    row.onclick = () => openLedgerDetail(row.dataset.slug);
+  });
+}
+async function loadLedger() {
+  const L = state.ledger;
+  L.busy = true; renderLedger();
+  const params = new URLSearchParams({offset: String(L.offset), limit: String(L.pageSize)});
+  if (L.status) params.set('status', L.status);
+  if (L.query) params.set('q', L.query);
+  try {
+    const data = await api(`/api/admin/ledger?${params}`);
+    L.items = data.contacts || [];
+    L.total = data.total || 0;
+    $('ledger-note').textContent = `Shared Supabase ledger · ${Number(L.total).toLocaleString()} stored member${L.total === 1 ? '' : 's'}. Click a row for details.`;
+  } catch (error) {
+    L.items = []; L.total = 0;
+    $('ledger-note').textContent = `Could not load ledger: ${errorText(error)}`;
+  }
+  L.busy = false; renderLedger();
+}
+async function openLedgerDetail(slug) {
+  if (!slug) return;
+  state.mem.openId = null;
+  $('detail').hidden = false; $('scrim').hidden = false;
+  $('detail-name').textContent = 'Loading…'; $('detail-sub').textContent = slug; $('detail-body').innerHTML = '';
+  try {
+    const data = await api(`/api/admin/ledger/${encodeURIComponent(slug)}`);
+    const c = data.contact || {};
+    const local = data.local || [];
+    $('detail-name').textContent = c.candidate_name || slug;
+    $('detail-sub').textContent = [c.country, c.status, c.account_label || c.account_id].filter(Boolean).join(' · ');
+    const profile = c.profile_url ? `<a href="${escapeHtml(c.profile_url)}" target="_blank" rel="noopener">${escapeHtml(c.profile_url)}</a>` : '—';
+    const stack = Array.isArray(c.stack) ? c.stack.join(', ') : (typeof c.stack === 'string' ? c.stack : '');
+    const localHtml = local.length
+      ? `<div class="table-wrap"><table class="plain"><thead><tr><th>Local profile</th><th>Country</th><th>Role</th><th>Sent</th><th>Replies</th></tr></thead><tbody>${local.map((row) => `<tr><td>${escapeHtml(row.account_label || row.account_id || '—')}</td><td>${escapeHtml(row.country || '—')}</td><td>${escapeHtml(row.suggested_role || '—')}</td><td>${row.sent || 0}</td><td>${row.replies || 0}</td></tr>`).join('')}</tbody></table></div>`
+      : '<p class="muted">No matching local member rows on this server (they may have been cleaned after uninstall).</p>';
+    $('detail-body').innerHTML =
+      `<dl class="facts"><dt>Slug</dt><dd>${escapeHtml(c.talent_slug || slug)}</dd><dt>Country</dt><dd>${escapeHtml(c.country || '—')}</dd><dt>Status</dt><dd>${tag(c.status || 'sent')}</dd><dt>Category</dt><dd>${escapeHtml(c.category || '—')}</dd><dt>Profile</dt><dd>${profile}</dd><dt>Account</dt><dd>${escapeHtml(c.account_label || c.account_id || '—')}</dd><dt>Sent at</dt><dd>${escapeHtml(formatDate(c.sent_at))}</dd><dt>Updated</dt><dd>${escapeHtml(formatDate(c.updated_at || c.created_at))}</dd>${c.error ? `<dt>Error</dt><dd class="err">${escapeHtml(c.error)}</dd>` : ''}${stack ? `<dt>Stack</dt><dd>${escapeHtml(stack)}</dd>` : ''}</dl>` +
+      (c.message_body ? `<div><p class="group">LEDGER MESSAGE</p><div class="profile">${escapeHtml(c.message_body.slice(0, 2000))}</div></div>` : '') +
+      (c.summary ? `<div><p class="group">SUMMARY</p><div class="profile">${escapeHtml(String(c.summary).slice(0, 1500))}</div></div>` : '') +
+      `<div><p class="group">LOCAL COPIES ON THIS SERVER</p>${localHtml}</div>`;
+  } catch (error) {
+    $('detail-name').textContent = 'Could not load ledger member';
+    $('detail-sub').textContent = errorText(error);
+  }
+}
+$('ledger-refresh').onclick = () => loadLedger();
+$('ledger-prev').onclick = () => { state.ledger.offset = Math.max(0, state.ledger.offset - state.ledger.pageSize); loadLedger(); };
+$('ledger-next').onclick = () => { state.ledger.offset += state.ledger.pageSize; loadLedger(); };
+let ledgerSearchTimer = null;
+$('ledger-search').oninput = () => {
+  clearTimeout(ledgerSearchTimer);
+  ledgerSearchTimer = setTimeout(() => { state.ledger.query = $('ledger-search').value.trim(); state.ledger.offset = 0; loadLedger(); }, 250);
+};
 
 
 // ---------- playbook (.md) ----------
