@@ -1,13 +1,14 @@
-"""Hiring conversation. Steps 1 to 3 are the same for every candidate. Step 4 depends on the suggested role.
+"""Hiring conversation. Steps 1 to 3 are shared. An experience check sits between the introduction and the process. Step 5 depends on the role.
 
 Stages (the stage is the state a conversation is left in by our last SENT message):
   first_sent      step 1 sent: short offer for one suggested role
   intro_sent      step 2 sent: company introduction, asked about interest and confidence
-  process_sent    step 3 sent: hiring process overview, asked if it works
-  assessment_sent step 4, developer roles: assessment overview, asked for the GitHub username
+  experience_sent step 3 sent: profile-based experience question, asked for a short work background
+  process_sent    step 4 sent: hiring process overview, asked if it works
+  assessment_sent step 5, developer roles: assessment overview, asked for the GitHub username
   invite_pending  developer roles: username received, but the invitation failed on our side. It is retried automatically
   invited         developer roles: GitHub invitation sent, assessment requirements are in the project
-  apply_sent      step 4, business roles: careers-page link for the suggested position sent
+  apply_sent      step 5, business roles: careers-page link for the suggested position sent
   closed          candidate declined
 A candidate reply moves the conversation one step forward, or gets a short answer that repeats the open question.
 """
@@ -19,7 +20,9 @@ from .config import settings
 from .db import connection, get_state, utc_now
 from .github import GitHubError, GitHubUserNotFound, detect_email, detect_username, invite_to_repository, repository_name, settings_ready
 
-FIRST, INTRO, PROCESS, ASSESSMENT, INVITE_PENDING, INVITED, APPLY, CLOSED = "first_sent", "intro_sent", "process_sent", "assessment_sent", "invite_pending", "invited", "apply_sent", "closed"
+FIRST, INTRO, EXPERIENCE, PROCESS, ASSESSMENT, INVITE_PENDING, INVITED, APPLY, CLOSED = (
+    "first_sent", "intro_sent", "experience_sent", "process_sent", "assessment_sent", "invite_pending", "invited", "apply_sent", "closed"
+)
 FINAL_STAGES = {INVITED, APPLY}
 # Reply time counts from when the reply is detected. Polling adds up to REPLY_POLL_INTERVAL_SECONDS, so the total stays near 1 to 2 minutes.
 REPLY_DELAY_SECONDS = (40, 85)
@@ -102,6 +105,8 @@ async def plan_reply(candidate: dict, body: str, history: list[dict]) -> dict | 
             level = int(get_state("intro_level", "1"))  # learned: the wording of the introduction that Himalayas accepts
             return {"body": await ai.write_intro(candidate, role, level), "stage": INTRO, "variant": level}
         if stage == INTRO:
+            return {"body": await ai.write_experience(candidate, role), "stage": EXPERIENCE}
+        if stage == EXPERIENCE:
             return {"body": ai.process_message(name, role), "stage": PROCESS}
         # Process agreed. Developers take an assessment. Business roles apply on their careers page.
         if ai.is_developer_role(role):
@@ -113,11 +118,12 @@ async def plan_reply(candidate: dict, body: str, history: list[dict]) -> dict | 
 
 async def invite(candidate: dict, username: str, stage: str = ASSESSMENT) -> dict | None:
     name = candidate["name"]
+    role = candidate.get("suggested_role") or ""
     with connection() as conn:
         conn.execute("UPDATE candidates SET github_username=? WHERE id=?", (username, candidate["id"]))
     written = ai.PROMPTS.get("mode") == "prompt"
     try:
-        await invite_to_repository(username)
+        await invite_to_repository(username, role)
     except GitHubUserNotFound:
         return {"body": await prompted.invitation_message(candidate, username, "not_found") if written else ai.username_not_found_message(name, username), "stage": ASSESSMENT}
     except GitHubError as exc:
@@ -130,14 +136,15 @@ async def invite(candidate: dict, username: str, stage: str = ASSESSMENT) -> dic
         return {"body": await prompted.invitation_message(candidate, username, "pending") if written else ai.invite_pending_message(name), "stage": INVITE_PENDING}
     with connection() as conn:
         conn.execute("UPDATE candidates SET github_invited_at=? WHERE id=?", (utc_now(), candidate["id"]))
-    return {"body": await prompted.invitation_message(candidate, username, "invited") if written else ai.invited_message(name, username, repository_name()), "stage": INVITED, "invited": True}
+    return {"body": await prompted.invitation_message(candidate, username, "invited") if written else ai.invited_message(name, username, repository_name(role)), "stage": INVITED, "invited": True}
 
 
 async def retry_invitation(candidate: dict) -> dict | None:
     """Retry an invitation that failed on our side. Returns the message to send, or None to try again later."""
     written = ai.PROMPTS.get("mode") == "prompt"
+    role = candidate.get("suggested_role") or ""
     try:
-        await invite_to_repository(candidate["github_username"])
+        await invite_to_repository(candidate["github_username"], role)
     except GitHubUserNotFound:
         return {"body": await prompted.invitation_message(candidate, candidate["github_username"], "not_found") if written else ai.username_not_found_message(candidate["name"], candidate["github_username"]), "stage": ASSESSMENT}
     except GitHubError as exc:
@@ -146,7 +153,7 @@ async def retry_invitation(candidate: dict) -> dict | None:
         return None
     with connection() as conn:
         conn.execute("UPDATE candidates SET github_invited_at=? WHERE id=?", (utc_now(), candidate["id"]))
-    return {"body": await prompted.invitation_message(candidate, candidate["github_username"], "invited") if written else ai.invited_message(candidate["name"], candidate["github_username"], repository_name()), "stage": INVITED, "invited": True}
+    return {"body": await prompted.invitation_message(candidate, candidate["github_username"], "invited") if written else ai.invited_message(candidate["name"], candidate["github_username"], repository_name(role)), "stage": INVITED, "invited": True}
 
 
 def candidates_waiting_for_invitation() -> list:

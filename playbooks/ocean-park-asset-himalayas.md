@@ -75,6 +75,7 @@ The question at the end of each step. It is repeated when the member does not an
 
 After first message: Would you like to hear more about this role?
 After introduction: How do you feel about this role, and how confident are you in this work?
+After experience: Could you tell me a little more about your recent experience with this kind of work?
 After process: Does this process work for you?
 After assessment: What is your GitHub username?
 
@@ -82,11 +83,11 @@ After assessment: What is your GitHub username?
 
 ### Hiring Process (Developer)
 
-Thank you for your interest. Here is a short overview of our hiring process. First, you complete a technical assessment. Second, we hold an interview about real project challenges and how you solve them. Third, we check your technical fit and how you work with the team. If all goes well, we discuss an offer. Then we help you start.
+Thank you for sharing that. Here is a short overview of our hiring process. First, you complete a technical assessment. Second, we hold an interview about real project challenges and how you solve them. Third, we check your technical fit and how you work with the team. If all goes well, we discuss an offer. Then we help you start.
 
 ### Hiring Process (Business)
 
-Thank you for your interest. Here is a short overview of our hiring process. First, you submit a short application form with a lightweight assessment. Second, you join {interview} with our leadership team. Third, selected candidates have a final interview and a contract.
+Thank you for sharing that. Here is a short overview of our hiring process. First, you submit a short application form with a lightweight assessment. Second, you join {interview} with our leadership team. Third, selected candidates have a final interview and a contract.
 
 ### Application
 
@@ -117,6 +118,7 @@ Thank you for your message.
 Rules for every text the AI writes.
 
 - Follow ASD STE100 Simplified Technical English: short sentences (maximum 20 words), common words, active voice, one idea in each sentence, no idioms, no slang.
+- Sound like a professional recruiter: calm, clear, and human. Avoid stiff template language.
 - Use plain text only. Do not use markdown, bullet symbols, or emoji.
 - Be brief. Do not add filler.
 - Do not promise salary, profit, returns, or job placement. Do not describe an investment or ask for money.
@@ -128,7 +130,7 @@ Rules for every text the AI writes.
 - Every candidate MUST get exactly one role from the list. Never answer null or "none".
 - Read the whole profile: work history, skills, tools, fields, and results.
 - Choose the role with the closest match. If no role matches exactly, choose the closest one through transferable strengths.
-  For example: brand, design, content, or community work fits Marketing Manager. Sales, partnerships, or fundraising fits Business Development Manager.
+  For example: brand, content, or community work fits Marketing Manager. Interface or product design fits UI/UX Designer. Sales, partnerships, or fundraising fits Business Development Manager.
   Support, account, or customer success work fits Client Relations Manager. HR, admin, logistics, or project work fits Operations Manager.
   Accounting, economics, data, or research work fits Financial Analyst. Legal, audit, risk, or KYC work fits Compliance Officer.
   Data science or machine learning work fits AI Developer. Any other software work fits the developer role closest to its stack.
@@ -163,27 +165,27 @@ Default business role: Operations Manager
 ### Full Stack Developer
 
 Type: developer
-Rate: The rate is $75 to $110 USD per hour.
+Rate: The rate is $125 to $165 USD per hour.
 
 ### Backend Developer
 
 Type: developer
-Rate: The rate is $70 to $110 USD per hour.
+Rate: The rate is $130 to $175 USD per hour.
 
 ### Frontend Developer
 
 Type: developer
-Rate: The rate is $60 to $100 USD per hour.
+Rate: The rate is $115 to $150 USD per hour.
 
 ### AI Developer
 
 Type: developer
-Rate: The rate is $95 to $120 USD per hour.
+Rate: The rate is $160 to $220 USD per hour.
 
 ### Business Development Manager
 
 Type: business
-Rate: The rate is $60 to $130 USD per hour, based on experience. You can also earn performance-based upside on closed business. Fixed-price milestones are possible for clearly defined mandates.
+Rate: The rate is $100 to $130 USD per hour, based on experience. You can also earn performance-based upside on closed business. Fixed-price milestones are possible for clearly defined mandates.
 Careers link: https://www.oceanparkasset.com/careers/business-development-manager
 Interview: a business or commercial interview
 Summary: Opens and closes new client and partner relationships, owning the pipeline from first contact to signed agreement.
@@ -201,7 +203,7 @@ Why people join: real ownership of the function, with no committee between you a
 ### Client Relations Manager
 
 Type: business
-Rate: The rate is $55 to $110 USD per hour, based on experience. Fixed-price milestones are possible for clearly defined scopes.
+Rate: The rate is $70 to $95 USD per hour, based on experience. Fixed-price milestones are possible for clearly defined scopes.
 Careers link: https://www.oceanparkasset.com/careers/client-relations-manager
 Interview: a client experience interview
 Summary: Owns the client after signing: onboarding, reporting, and retention. Is the reason clients stay.
@@ -219,7 +221,7 @@ Why people join: real ownership of the function, with no committee between you a
 ### Marketing Manager
 
 Type: business
-Rate: The rate is $55 to $115 USD per hour, based on experience. Fixed-price milestones are possible for clearly defined campaigns.
+Rate: The rate is $90 to $120 USD per hour, based on experience. Fixed-price milestones are possible for clearly defined campaigns.
 Careers link: https://www.oceanparkasset.com/careers/marketing-manager
 Interview: a marketing or strategy interview
 Summary: Owns brand, growth, and go-to-market: campaigns, channels, content, and how the company is positioned in the market.
@@ -234,10 +236,29 @@ Nice to have: an audience or network in fintech or Web3 communities; SEO, conten
 Engagement: freelance or contract, with potential for long-term collaboration. Flexible hours. Fully remote. Immediate start.
 Why people join: real ownership of the function, with no committee between you and the work. Work at the frontier, with AI, quantitative systems, and blockchain infrastructure applied to real capital. Fully remote from day one.
 
+
+### UI/UX Designer
+
+Type: business
+Rate: The rate is $100 to $130 USD per hour, based on experience. Fixed-price milestones are possible for clearly defined design scopes.
+Careers link: https://www.oceanparkasset.com/careers/ui-ux-designer
+Interview: a design interview
+Summary: Owns product interface and experience design: flows, screens, visual systems, and how people use the product.
+
+#### Details
+
+Owns the product interface and experience. Designs flows, screens, and visual systems so people can use the product with clarity and confidence.
+The role suits a designer who can turn requirements into clean interfaces and work closely with product and engineering.
+Duties: design user flows, wireframes, and high-fidelity interfaces; build and maintain a clear visual and interaction system; run lightweight research and usability checks; work with engineering on implementation quality; support marketing and product launches with design assets when needed.
+Looks for: UI/UX or product design experience; strong Figma skills; clear visual craft and interaction thinking; comfort working remotely with engineers and product owners. Experience from SaaS, fintech, or another industry is welcome. The company teaches its domain.
+Nice to have: design systems experience; prototyping skills; motion or illustration ability; exposure to dashboards or data-heavy products.
+Engagement: freelance or contract, with potential for long-term collaboration. Flexible hours. Fully remote. Immediate start.
+Why people join: real ownership of the function, with no committee between you and the work. Work at the frontier, with AI, quantitative systems, and blockchain infrastructure applied to real capital. Fully remote from day one.
+
 ### Operations Manager
 
 Type: business
-Rate: The rate is $60 to $120 USD per hour, based on experience. Fixed-price milestones are possible for clearly defined projects.
+Rate: The rate is $85 to $115 USD per hour, based on experience. Fixed-price milestones are possible for clearly defined projects.
 Careers link: https://www.oceanparkasset.com/careers/operations-manager
 Interview: an operations or process interview
 Summary: Makes the company run: internal processes, vendors, project delivery, and the systems that keep execution smooth.
@@ -255,7 +276,7 @@ Why people join: real ownership of the function, with no committee between you a
 ### Financial Analyst
 
 Type: business
-Rate: The rate is $70 to $150 USD per hour, based on experience. Fixed-price milestones are possible for defined research mandates.
+Rate: The rate is $85 to $115 USD per hour, based on experience. Fixed-price milestones are possible for defined research mandates.
 Careers link: https://www.oceanparkasset.com/careers/financial-analyst
 Interview: a research or analytical interview
 Summary: Turns markets and performance data into decisions through research, reporting, and analysis of the quantitative systems.
@@ -273,7 +294,7 @@ Why people join: real ownership of the function, with no committee between you a
 ### Compliance Officer
 
 Type: business
-Rate: The rate is $80 to $160 USD per hour, based on experience and jurisdiction. Retainer or fractional arrangements are possible for senior candidates.
+Rate: The rate is $110 to $150 USD per hour, based on experience and jurisdiction. Retainer or fractional arrangements are possible for senior candidates.
 Careers link: https://www.oceanparkasset.com/careers/compliance-officer
 
 Summary: Builds and owns the compliance function: framework, KYC/AML, regulatory monitoring, and record-keeping.

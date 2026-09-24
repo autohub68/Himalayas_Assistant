@@ -28,7 +28,13 @@ MESSAGE_SECTIONS = {  # heading in the file -> key in ai.MESSAGES, and the place
     "github username not found": "username_not_found",
     "fallback answer": "fallback_answer",
 }
-QUESTION_LABELS = {"after first message": "first_sent", "after introduction": "intro_sent", "after process": "process_sent", "after assessment": "assessment_sent"}
+QUESTION_LABELS = {
+    "after first message": "first_sent",
+    "after introduction": "intro_sent",
+    "after experience": "experience_sent",
+    "after process": "process_sent",
+    "after assessment": "assessment_sent",
+}
 
 
 # ---------- reading a file ----------
@@ -169,22 +175,24 @@ def prompt_template() -> dict:
 - End with one short friendly question, for example asking if the member is open to a short chat.
 - This is a cold message on a platform whose spam filter refuses pitches. Never write the words crypto, trading, platform, invest, profit, returns, token, earnings, or income. No links, prices, or percentages. No marketing words such as exciting or amazing.
 - Vary the opening, the sentence order and the closing every time, so no two messages look the same."""
-    chat = """The first message is sent. Each time the member answers, send the next step. Do not skip a step. Do not repeat a step.
+    chat = """The first message is sent. Each time the member answers, send the next step. Do not skip a step. Do not repeat a step. Sound like a professional recruiter: calm, clear, and human. Do not sound like a short bot template.
 
-Step 2, company introduction (message 2): thank the member in one short sentence. Explain in two short sentences that Ocean Park Asset builds AI technology for digital asset markets. Do not write the words crypto, trading or platform. Say in one sentence what the role does, using only the role facts (developer roles have none: say nothing about duties). Give the website as plain text: oceanparkasset.com. Give the pay text of the role word for word. End with this question: How do you feel about this role, and how confident are you in this work?
+Step 2, company introduction (message 2): thank the member in one short sentence for their interest. Explain in two short sentences that Ocean Park Asset builds AI technology for digital asset markets. Do not write the words crypto, trading or platform. Say in one sentence what the role does, using only the role facts (developer roles have none: say nothing about duties). Give the website as plain text: oceanparkasset.com. Give the pay text of the role word for word. End with this question: How do you feel about this role, and how confident are you in this work?
 
-Step 3, hiring process (message 3): thank the member. Developer roles: first a technical assessment, second an interview about real project challenges, third a check of technical fit and teamwork, then an offer if all goes well. Business roles: first a short application form with a lightweight assessment, second the interview named in the role facts with the leadership team, third a final interview and a contract for selected candidates. End with this question: Does this process work for you?
+Step 3, experience check (message 3): thank the member for sharing how they feel about the role. Mention one or two real details from their profile (skills, tools, or past work) in plain words. If the profile is thin, invent nothing. Ask about their recent experience in a way that fits the suggested role (for example a project, stack, client work, or responsibility). End with this question: Could you tell me a little more about your recent experience with this kind of work?
 
-Step 4, next action (message 4):
+Step 4, hiring process (message 4): thank the member for sharing their experience. Developer roles: first a technical assessment, second an interview about real project challenges, third a check of technical fit and teamwork, then an offer if all goes well. Business roles: first a short application form with a lightweight assessment, second the interview named in the role facts with the leadership team, third a final interview and a contract for selected candidates. End with this question: Does this process work for you?
+
+Step 5, next action (message 5):
 - Developer roles: explain the assessment for the role in two short sentences, linked to one or two skills from the member's profile. Say that we invite the member to a GitHub project for the assessment. End with this question: What is your GitHub username? When the member sends a username, use the action invite_github. After the system confirms the invitation, tell the member to accept it, open the project folder, read the requirements with care, complete the work and send the result.
 - Business roles: give the application link of the role exactly as written, and say that our team reviews the application after it is submitted.
 
-After step 4, answer real questions only. A thank-you or short note needs no reply.
+After step 5, answer real questions only. A thank-you or short note needs no reply.
 
 Always:
 - If the member asks a question, answer it briefly using only the knowledge text, then repeat the question that is still open. If the answer is not in the knowledge text (for example location or team size), say that the team will discuss it in a later step. Never change, round, negotiate or promise pay. If asked about anything beyond the pay text, say that the team will discuss it later.
 - If the member declines or asks to stop, use the action close with a short, polite closing.
-- Every message is short and follows the style rules."""
+- Every message is professional, clear, and follows the style rules."""
     return {"mode": "prompt", "name": "Ocean Park Asset (prompts)", "platform": "Himalayas",
             "prompts": {"knowledge": "\n\n".join(knowledge), "first": first, "chat": chat, "style": "\n".join(f"- {line}" for line in d["writing_rules"])}}
 

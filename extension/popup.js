@@ -1,4 +1,4 @@
-const API = 'http://localhost:8765';
+const API = 'http://127.0.0.1:8765';
 const $ = (id) => document.getElementById(id);
 let currentPage = 1;
 let refreshing = false;
@@ -27,7 +27,7 @@ async function request(path, options = {}) {
   if (!response.ok) throw new Error(await response.text());
   return response.json();
 }
-const settingFields = ['openrouter_api_key', 'supabase_url', 'supabase_key', 'github_token', 'github_owner', 'github_repo', 'min_message_delay_seconds', 'max_message_delay_seconds', 'daily_dm_limit'];
+const settingFields = ['openrouter_api_key', 'supabase_url', 'supabase_key', 'github_token', 'github_owner', 'github_repo', 'github_ai_repo', 'min_message_delay_seconds', 'max_message_delay_seconds', 'daily_dm_limit'];
 async function loadSettings() {
   const [values, account] = await Promise.all([request('/api/settings'), request('/api/account')]);
   $('account_label').value = account.label || '';

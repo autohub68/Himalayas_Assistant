@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Himalayas Hiring Assistant",
-  "version": "0.1.2",
+  "version": "0.1.4",
   "description": "Review candidates, draft outreach, and manage recruiting conversations.",
   "action": {
     "default_popup": "popup.html"
@@ -15,6 +15,7 @@
     "alarms"
   ],
   "host_permissions": [
+    "http://127.0.0.1:8765/*",
     "http://localhost:8765/*"
   ],
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAjUBWmzfJpm31rWDJcYwXgYDj/ZlyekkLEHHtDyfQ1Qu6rzrviitCj0EWQ1JIu3rANDYFI0UH2svvOVR+lZexzFHt5Va7RtdNJY0IUIWMAPdFfg2kQH1r9/aYW+ezn+HIlHhamiTJKsSbQb7zlWnlfMvqMLvkvKhAICsDoaqW8kOmovLSgD6yiGDf9SSV7CdcHYkxIg33JDj0MbOS11UxNDoGhCx4IE2K+BNveG7squH7BnNbcG4GUqEIkNtnJNiwBBGqplfZ5Pl9/muaWlXeFvVxaZLFA32Z2z02JwF0+frsNGDA78sR5PKap4Ids/FmzxtEvIEo7k5Ccfh0tCIx8QIDAQAB"

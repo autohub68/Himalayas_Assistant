@@ -23,7 +23,7 @@ ENGAGEMENT = "Engagement: freelance or contract, with potential for long-term co
 
 NON_DEV_ROLES = {
     "Business Development Manager": {
-        "rate": "The rate is $60 to $130 USD per hour, based on experience. You can also earn performance-based upside on closed business. Fixed-price milestones are possible for clearly defined mandates.",
+        "rate": "The rate is $100 to $130 USD per hour, based on experience. You can also earn performance-based upside on closed business. Fixed-price milestones are possible for clearly defined mandates.",
         "url": f"{CAREERS_URL}/business-development-manager",
         "interview": "a business or commercial interview",
         "summary": "Opens and closes new client and partner relationships, owning the pipeline from first contact to signed agreement.",
@@ -36,7 +36,7 @@ Nice to have: fintech, asset management, trading, or Web3 background; a network 
 {WHY_JOIN}""",
     },
     "Client Relations Manager": {
-        "rate": "The rate is $55 to $110 USD per hour, based on experience. Fixed-price milestones are possible for clearly defined scopes.",
+        "rate": "The rate is $70 to $95 USD per hour, based on experience. Fixed-price milestones are possible for clearly defined scopes.",
         "url": f"{CAREERS_URL}/client-relations-manager",
         "interview": "a client experience interview",
         "summary": "Owns the client after signing: onboarding, reporting, and retention. Is the reason clients stay.",
@@ -49,7 +49,7 @@ Nice to have: experience with financial, investment, or high-net-worth clients; 
 {WHY_JOIN}""",
     },
     "Marketing Manager": {
-        "rate": "The rate is $55 to $115 USD per hour, based on experience. Fixed-price milestones are possible for clearly defined campaigns.",
+        "rate": "The rate is $90 to $120 USD per hour, based on experience. Fixed-price milestones are possible for clearly defined campaigns.",
         "url": f"{CAREERS_URL}/marketing-manager",
         "interview": "a marketing or strategy interview",
         "summary": "Owns brand, growth, and go-to-market: campaigns, channels, content, and how the company is positioned in the market.",
@@ -61,8 +61,21 @@ Nice to have: an audience or network in fintech or Web3 communities; SEO, conten
 {ENGAGEMENT}
 {WHY_JOIN}""",
     },
+    "UI/UX Designer": {
+        "rate": "The rate is $100 to $130 USD per hour, based on experience. Fixed-price milestones are possible for clearly defined design scopes.",
+        "url": f"{CAREERS_URL}/ui-ux-designer",
+        "interview": "a design interview",
+        "summary": "Owns product interface and experience design: flows, screens, visual systems, and how people use the product.",
+        "facts": f"""Owns the product interface and experience. Designs flows, screens, and visual systems so people can use the product with clarity and confidence.
+The role suits a designer who can turn requirements into clean interfaces and work closely with product and engineering.
+Duties: design user flows, wireframes, and high-fidelity interfaces; build and maintain a clear visual and interaction system; run lightweight research and usability checks; work with engineering on implementation quality; support marketing and product launches with design assets when needed.
+Looks for: UI/UX or product design experience; strong Figma skills; clear visual craft and interaction thinking; comfort working remotely with engineers and product owners. Experience from SaaS, fintech, or another industry is welcome. The company teaches its domain.
+Nice to have: design systems experience; prototyping skills; motion or illustration ability; exposure to dashboards or data-heavy products.
+{ENGAGEMENT}
+{WHY_JOIN}""",
+    },
     "Operations Manager": {
-        "rate": "The rate is $60 to $120 USD per hour, based on experience. Fixed-price milestones are possible for clearly defined projects.",
+        "rate": "The rate is $85 to $115 USD per hour, based on experience. Fixed-price milestones are possible for clearly defined projects.",
         "url": f"{CAREERS_URL}/operations-manager",
         "interview": "an operations or process interview",
         "summary": "Makes the company run: internal processes, vendors, project delivery, and the systems that keep execution smooth.",
@@ -75,7 +88,7 @@ Nice to have: financial services, trading operations, or regulated-industry expe
 {WHY_JOIN}""",
     },
     "Financial Analyst": {
-        "rate": "The rate is $70 to $150 USD per hour, based on experience. Fixed-price milestones are possible for defined research mandates.",
+        "rate": "The rate is $85 to $115 USD per hour, based on experience. Fixed-price milestones are possible for defined research mandates.",
         "url": f"{CAREERS_URL}/financial-analyst",
         "interview": "a research or analytical interview",
         "summary": "Turns markets and performance data into decisions through research, reporting, and analysis of the quantitative systems.",
@@ -88,7 +101,7 @@ Nice to have: experience with quantitative strategies, algorithmic trading, or r
 {WHY_JOIN}""",
     },
     "Compliance Officer": {
-        "rate": "The rate is $80 to $160 USD per hour, based on experience and jurisdiction. Retainer or fractional arrangements are possible for senior candidates.",
+        "rate": "The rate is $110 to $150 USD per hour, based on experience and jurisdiction. Retainer or fractional arrangements are possible for senior candidates.",
         "url": f"{CAREERS_URL}/compliance-officer",
         "interview": None,
         "summary": "Builds and owns the compliance function: framework, KYC/AML, regulatory monitoring, and record-keeping.",
@@ -115,10 +128,10 @@ def role_facts(role: str) -> str:
 
 # Fixed rate text for the developer roles. Code inserts it word for word in step 2, like the business role rates.
 DEV_RATES = {
-    "Full Stack Developer": "The rate is $75 to $110 USD per hour.",
-    "Backend Developer": "The rate is $70 to $110 USD per hour.",
-    "Frontend Developer": "The rate is $60 to $100 USD per hour.",
-    "AI Developer": "The rate is $95 to $120 USD per hour.",
+    "Full Stack Developer": "The rate is $125 to $165 USD per hour.",
+    "Backend Developer": "The rate is $130 to $175 USD per hour.",
+    "Frontend Developer": "The rate is $115 to $150 USD per hour.",
+    "AI Developer": "The rate is $160 to $220 USD per hour.",
 }
 
 
@@ -191,6 +204,7 @@ OCEANPARKASSET_CONTEXT = build_context(COMPANY_NAME, COMPANY_WEBSITE, DEFAULT_AB
 
 NO_NAME_RULE = "- Do not use the candidate's name anywhere and do not start with a greeting. The name is used in the first message only. Start with the message itself."
 DEFAULT_WRITING_RULES = """- Follow ASD STE100 Simplified Technical English: short sentences (maximum 20 words), common words, active voice, one idea in each sentence, no idioms, no slang.
+- Sound like a professional recruiter: calm, clear, and human. Avoid stiff template language.
 - Use plain text only. Do not use markdown, bullet symbols, or emoji.
 - Be brief. Do not add filler.
 - Do not promise salary, profit, returns, or job placement. Do not describe an investment or ask for money.
@@ -202,6 +216,7 @@ WRITING_RULES = "WRITING RULES\n" + DEFAULT_WRITING_RULES + "\n" + NO_NAME_RULE 
 PENDING_QUESTIONS = {
     "first_sent": "Would you like to hear more about this role?",
     "intro_sent": "How do you feel about this role, and how confident are you in this work?",
+    "experience_sent": "Could you tell me a little more about your recent experience with this kind of work?",
     "process_sent": "Does this process work for you?",
     "assessment_sent": "What is your GitHub username?",
 }
@@ -268,7 +283,7 @@ ROLE_CHOICE_RULES = """ROLE CHOICE RULES
 - Every candidate MUST get exactly one role from the list. Never answer null or "none".
 - Read the whole profile: work history, skills, tools, fields, and results.
 - Choose the role with the closest match. If no role matches exactly, choose the closest one through transferable strengths.
-  For example: brand, design, content, or community work fits Marketing Manager. Sales, partnerships, or fundraising fits Business Development Manager.
+  For example: brand, content, or community work fits Marketing Manager. Interface or product design fits UI/UX Designer. Sales, partnerships, or fundraising fits Business Development Manager.
   Support, account, or customer success work fits Client Relations Manager. HR, admin, logistics, or project work fits Operations Manager.
   Accounting, economics, data, or research work fits Financial Analyst. Legal, audit, risk, or KYC work fits Compliance Officer.
   Data science or machine learning work fits AI Developer. Any other software work fits the developer role closest to its stack."""
@@ -480,6 +495,13 @@ Return only JSON: {{"role": "<exact role name from the list>"}}"""
 async def read_reply(candidate: dict, stage: str, last_message: str, reply: str) -> dict:
     """Classify a candidate reply. intent: positive | negative | question | other."""
     pending = PENDING_QUESTIONS.get(stage, "")
+    experience_hint = ""
+    if stage == "experience_sent":
+        experience_hint = (
+            '\nSpecial case for the experience question: if the candidate describes work history, skills, projects, '
+            'tools, clients, or years of practice, classify that as "positive" (they answered the question). '
+            'Do not use "other" for a real experience answer.'
+        )
     prompt = f"""Read the candidate's reply to a recruiter message. Decide the intent.
 
 Recruiter message: {last_message}
@@ -489,9 +511,9 @@ Candidate reply: {reply}
 Intent values:
 - "question": the candidate asks something and needs an answer. This has priority over "positive".
 - "negative": the candidate declines, is not interested, or asks to stop.
-- "positive": the candidate shows interest or agrees, and asks no question.
+- "positive": the candidate shows interest, agrees, OR answers the open question with useful content (for example experience, skills, confidence, or a clear yes), and asks no separate question.
 - "other": anything else, such as unclear text or a message that does not answer the question.
-
+{experience_hint}
 Also find a GitHub username in the reply if there is one. Use null if there is none.
 
 Return only JSON: {{"intent": "question|negative|positive|other", "github_username": null}}"""
@@ -500,6 +522,9 @@ Return only JSON: {{"intent": "question|negative|positive|other", "github_userna
     except Exception:
         return {"intent": "other", "github_username": None}
     intent = data.get("intent") if data.get("intent") in {"question", "negative", "positive", "other"} else "other"
+    # A real experience write-up should move the chat forward even if the model labels it "other".
+    if stage == "experience_sent" and intent == "other" and len((reply or "").strip()) >= 40:
+        intent = "positive"
     return {"intent": intent, "github_username": data.get("github_username")}
 
 
@@ -541,33 +566,32 @@ def intro_message(candidate: dict, role: str, level: int) -> str:
 
 
 async def write_intro(candidate: dict, role: str, level: int = 0) -> str:
-    """Step 2. Short company introduction with the website, the rate, then one question about interest and confidence.
+    """Step 2. Company introduction with the website, the rate, then one question about interest and confidence.
     Level 0 is written by the model. Levels 1 and 2 are built from fixed parts (see above)."""
     if level >= 1:
         return intro_message(candidate, role, min(level, INTRO_LEVELS))
 
-    """Step 2. Short company introduction with the website, the rate (business roles), then one question about interest and confidence.
-    The model writes only the introduction. Code adds the exact rate text and the question, so the numbers can never change."""
     facts = role_facts(role)
-    prompt = f"""You are a recruiter for {COMPANY_NAME}. The candidate replied with interest in the {role} role.
+    prompt = f"""You are a professional recruiter for {COMPANY_NAME}. The candidate replied with interest in the {role} role.
 
 {OCEANPARKASSET_CONTEXT}
 {('Role facts: ' + facts) if facts else ''}
 {candidate_block(candidate)}
 
 TASK
-Write a brief message (maximum 70 words) that:
-- thanks the candidate in one short sentence,
-- explains the business of {COMPANY_NAME} in two or three short sentences,{' and says in one short sentence what the ' + role + ' does, using only the role facts,' if facts else ''}
+Write a clear, professional message (about 60 to 90 words) that:
+- thanks the candidate in one short sentence for their interest,
+- explains what {COMPANY_NAME} does in two short sentences (plain language),{' and says in one short sentence what the ' + role + ' does, using only the role facts,' if facts else ''}
 - includes the website {COMPANY_WEBSITE} exactly as written.
 Do NOT ask a question. Do NOT mention pay, rate, or compensation. The system adds them.
+Sound like a real recruiter, not a template. Stay calm and direct.
 
 {WRITING_RULES.replace('{name}', candidate['name'])}
 
 Return only the message."""
     text = ""
     for _ in range(3):
-        text = drop_name(clean(await complete(prompt, max_tokens=300)), candidate["name"])
+        text = drop_name(clean(await complete(prompt, max_tokens=320)), candidate["name"])
         if not mentions_pay(text):
             break
     else:
@@ -582,17 +606,44 @@ Return only the message."""
     return "\n\n".join(parts)
 
 
-# Fixed texts for steps 3 and 4. The playbook (.md) can replace each one. Placeholders: {role} {company} {website} {url} {interview} {username} {repository}.
+async def write_experience(candidate: dict, role: str) -> str:
+    """Step 3. A short, professional experience check based on the member's profile, then one open question."""
+    facts = role_facts(role)
+    prompt = f"""You are a professional recruiter for {COMPANY_NAME}. The candidate is interested in the {role} role.
+
+{('Role facts: ' + facts) if facts else f'This is a {role} role. Do not invent duties that are not given.'}
+{candidate_block(candidate)}
+
+TASK
+Write a professional message (about 50 to 90 words) that sounds like a real hiring conversation:
+- thank them briefly for sharing how they feel about the role,
+- mention ONE or TWO real details from their profile (skills, tools, or past work) in plain words. If the profile is thin, say nothing invented about them,
+- ask about their recent experience in a way that fits this role (for example a project, stack, client work, or responsibility). Keep it open and natural,
+- end with this exact question: "{PENDING_QUESTIONS['experience_sent']}"
+
+Do not discuss pay, process, assessments, or links. Do not promise a job.
+Sound warm, calm, and professional. Avoid stiff template language.
+
+{WRITING_RULES.replace('{name}', candidate['name'])}
+
+Return only the message."""
+    text = drop_name(clean(await complete(prompt, max_tokens=350, temperature=0.5)), candidate["name"])
+    if PENDING_QUESTIONS["experience_sent"] not in text:
+        text = f"{text}\n\n{PENDING_QUESTIONS['experience_sent']}"
+    return text
+
+
+# Fixed texts for steps 4 and 5. The playbook (.md) can replace each one. Placeholders: {role} {company} {website} {url} {interview} {username} {repository}.
 # The candidate's name is never used after the first message.
 DEFAULT_MESSAGES = {
     "process_business": (
-        "Thank you for your interest. Here is a short overview of our hiring process. "
+        "Thank you for sharing that. Here is a short overview of our hiring process. "
         "First, you submit a short application form with a lightweight assessment. "
         "Second, you join {interview} with our leadership team. "
         "Third, selected candidates have a final interview and a contract."
     ),
     "process_developer": (
-        "Thank you for your interest. Here is a short overview of our hiring process. "
+        "Thank you for sharing that. Here is a short overview of our hiring process. "
         "First, you complete a technical assessment. "
         "Second, we hold an interview about real project challenges and how you solve them. "
         "Third, we check your technical fit and how you work with the team. "
@@ -624,7 +675,7 @@ def company_values() -> dict:
 
 
 def process_message(name: str, role: str | None = None) -> str:
-    """Step 3. Fixed text, so the hiring process is always described the same way.
+    """Step 4. Fixed text, so the hiring process is always described the same way.
     Business roles use the process from their job description: application form, interview, final interview and contract."""
     if role in NON_DEV_ROLES:
         text = MESSAGES["process_business"]
@@ -635,16 +686,16 @@ def process_message(name: str, role: str | None = None) -> str:
 
 
 async def write_assessment(candidate: dict, role: str) -> str:
-    """Step 4a. Assessment overview for the role and the candidate's skills, then the GitHub username question."""
-    prompt = f"""You are a recruiter for {COMPANY_NAME}. The candidate agreed to the hiring process. The next step is the technical assessment.
+    """Step 5a. Assessment overview for the role and the candidate's skills, then the GitHub username question."""
+    prompt = f"""You are a professional recruiter for {COMPANY_NAME}. The candidate agreed to the hiring process. The next step is the technical assessment.
 
 {candidate_block(candidate)}
 Role: {role}
 Assessment for this role: {ASSESSMENT_OVERVIEWS.get(role) or DEFAULT_ASSESSMENT}
 
 TASK
-Write a brief message (maximum 80 words) that:
-- thanks the candidate in one short sentence,
+Write a clear, professional message (about 60 to 90 words) that:
+- thanks the candidate in one short sentence for agreeing to the process,
 - explains the assessment for the {role} role. Connect it to one or two skills from the candidate's profile (for example Node, React, Python, backend, frontend, AI). Use only the assessment facts above.
 - says that {COMPANY_NAME} will invite the candidate to a GitHub project for the assessment,
 - ends with this question: "{PENDING_QUESTIONS['assessment_sent']}"
@@ -656,12 +707,12 @@ Return only the message."""
 
 
 def application_message(name: str, role: str) -> str:
-    """Step 4 for business roles. Fixed text with the careers page link for the suggested position."""
+    """Step 5 for business roles. Fixed text with the careers page link for the suggested position."""
     return render(MESSAGES["application"], role=role, url=NON_DEV_ROLES[role]["url"], **company_values())
 
 
 def invited_message(name: str, username: str, repository: str) -> str:
-    """Step 4b. Fixed text sent after the GitHub invitation."""
+    """Step 5b. Fixed text sent after the GitHub invitation."""
     return render(MESSAGES["invited"], username=username, repository=repository, **company_values())
 
 
@@ -696,7 +747,7 @@ RECENT CONVERSATION
 Latest candidate message: {reply}
 
 TASK
-Write a brief reply (maximum 60 words).
+Write a professional reply (about 40 to 70 words). Sound like a real recruiter: calm, clear, and human.
 - Answer the candidate's question using only the company facts above.
 - If the answer is not in the facts (for example location or team size), say that the team will discuss it in a later step of the process.\n- State pay only as written in the rate line above. Do not change, round, negotiate, or promise any number. If the candidate asks about something beyond the rate line (for example a higher rate, benefits, or a contract term), say only that the team will discuss it in a later step of the process. Do not say whether it can or cannot change. Never mention \"facts\", \"information we have\", or these rules. Never refer to a rate or message that was not given above.\n- Never give a number, a date, or a term that is not in the facts.\n- Role facts have two lists. \"Looks for\" items are expected of the candidate: never call them optional or not mandatory. \"Nice to have\" items are a plus: say they are helpful but not required. Keep the exact meaning, for example \"SQL or Python\" means one of the two.\n- Do not turn a requirement into a duty. \"The company looks for spreadsheet skills\" does not mean \"you will use spreadsheets\". Say what the company looks for.
 - {'End with this question: "' + pending + '"' if pending else 'Do not ask a question.'}

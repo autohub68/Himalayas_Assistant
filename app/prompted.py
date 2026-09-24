@@ -242,7 +242,7 @@ async def outcome_message(candidate: dict, history_note: str, username: str = ""
 
 async def invitation_message(candidate: dict, username: str, result: str) -> str:
     """result: invited | not_found | pending"""
-    repository = repository_name()
+    repository = repository_name(candidate.get("suggested_role"))
     notes = {
         "invited": f"The system just sent the GitHub invitation to the account {username} for the project {repository}. Write the message that the chat logic prompt asks for after the invitation.",
         "not_found": f"The system could not find a GitHub account named {username}. Ask the member to check the spelling and send the username again.",

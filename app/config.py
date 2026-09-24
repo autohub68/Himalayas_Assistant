@@ -33,7 +33,8 @@ class Settings(BaseSettings):
     github_token: str = ""
     github_api_url: str = "https://api.github.com"
     github_owner: str = ""
-    github_repo: str = ""
+    github_repo: str = "Tech_Assessment"  # Full Stack, Backend, Frontend developers
+    github_ai_repo: str = "AI_Assessment"  # AI Developer only
     # Remote access to the Control center. Requests from this machine need no password. Any other request needs this login.
     # With no password set, remote requests are refused. SERVER_HOST=0.0.0.0 makes the server reachable from other machines.
     server_host: str = "127.0.0.1"

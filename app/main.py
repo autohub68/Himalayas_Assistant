@@ -145,8 +145,8 @@ def delivery_state(account_id: str) -> dict:
 
 
 last_seen_written: dict[str, float] = {}
-# Extension heartbeats about every 30s. Past this, the Control center treats the Chrome extension as gone.
-EXTENSION_ONLINE_SECONDS = 120
+# Extension heartbeats about every 30s. Past this (with no uninstall ping), the Control center treats it as gone.
+EXTENSION_ONLINE_SECONDS = 90
 
 
 def touch_seen(account_id: str) -> None:
@@ -154,9 +154,21 @@ def touch_seen(account_id: str) -> None:
     now = time.monotonic()
     if now - last_seen_written.get(account_id, -1000.0) < 30:
         return
-    last_seen_written[account_id] = now
     with connection() as conn:
+        row = conn.execute("SELECT last_seen FROM accounts WHERE id=?", (account_id,)).fetchone()
+        previous = row["last_seen"] if row else None
         conn.execute("UPDATE accounts SET last_seen=? WHERE id=?", (utc_now(), account_id))
+    last_seen_written[account_id] = now
+    # Control center mirrors live extensions: announce when a profile appears or comes back online.
+    if not extension_online(previous):
+        publish_dashboard_update("extension_online", account_id)
+
+
+def mark_extension_offline(account_id: str) -> None:
+    """Clear presence so the Control center shows the profile as offline immediately."""
+    last_seen_written.pop(account_id, None)
+    with connection() as conn:
+        conn.execute("UPDATE accounts SET last_seen=NULL WHERE id=?", (account_id,))
 
 
 def extension_online(last_seen: str | None) -> bool:
@@ -187,6 +199,20 @@ def optional_account(
     return value
 
 
+def account_id_only(
+    x_account_id: Annotated[str | None, Header()] = None,
+    account_id: str | None = Query(default=None),
+) -> str:
+    """Resolve the account for long-lived streams without refreshing extension presence."""
+    value = x_account_id or account_id
+    if value is None:
+        raise HTTPException(status_code=400, detail="X-Account-Id header is required")
+    if not ACCOUNT_ID_PATTERN.match(value):
+        raise HTTPException(status_code=400, detail="Invalid account id")
+    ensure_account(value)
+    return value
+
+
 def get_account(account_id: Annotated[str | None, Depends(optional_account)]) -> str:
     if account_id is None:
         raise HTTPException(status_code=400, detail="X-Account-Id header is required")
@@ -194,6 +220,7 @@ def get_account(account_id: Annotated[str | None, Depends(optional_account)]) ->
 
 
 Account = Annotated[str, Depends(get_account)]
+StreamAccount = Annotated[str, Depends(account_id_only)]
 
 
 class CampaignRequest(BaseModel):
@@ -218,6 +245,7 @@ class SettingsUpdate(BaseModel):
     github_api_url: str | None = None
     github_owner: str | None = None
     github_repo: str | None = None
+    github_ai_repo: str | None = None
     auto_send: bool | None = None
     min_message_delay_seconds: int | None = Field(default=None, ge=5, le=86400)
     max_message_delay_seconds: int | None = Field(default=None, ge=5, le=86400)
@@ -368,6 +396,24 @@ async def health(account_id: Annotated[str | None, Depends(optional_account)]) -
     return {"ok": True, "auto_send": settings.auto_send, "himalayas_authorized": oauth_status(account_id), "himalayas_login": login_state(account_id), "hold": hold_reason(account_id), "paused": is_paused(account_id), "automation": automation_state(account_id), "reply_monitor": reply_monitor_state(account_id), "delivery": delivery_state(account_id), "loop_restarts": loop_crashes, "daily": daily_status(account_id), "company": get_state(f"himalayas_company:{account_id}")}
 
 
+@app.get("/api/extension/uninstalled")
+async def extension_uninstalled(account_id: str = Query(..., min_length=8, max_length=64)) -> HTMLResponse:
+    """Chrome opens this URL when the extension is removed. Drop the profile from the Control center at once."""
+    if not ACCOUNT_ID_PATTERN.match(account_id):
+        return HTMLResponse("<!doctype html><title>Invalid</title><p>Invalid account.</p>", status_code=400)
+    with connection() as conn:
+        row = conn.execute("SELECT id FROM accounts WHERE id=?", (account_id,)).fetchone()
+    if not row:
+        return HTMLResponse("<!doctype html><title>Removed</title><p>This profile is already gone. You can close this tab.</p>")
+    # Uninstall clears chrome.storage, so this account id can never reconnect. Remove it from the mirror.
+    delete_account_data(account_id)
+    publish_dashboard_update("account_removed", account_id)
+    return HTMLResponse(
+        "<!doctype html><title>Extension removed</title><p>Profile removed from the Control center. You can close this tab.</p>",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 def is_paused(account_id: str) -> bool:
     with connection() as conn:
         row = conn.execute("SELECT paused FROM accounts WHERE id=?", (account_id,)).fetchone()
@@ -457,19 +503,22 @@ async def check_settings(values: dict) -> tuple[list[str], list[str]]:
                     errors.append(f"OpenRouter rejected this API key ({response.status_code}).")
             except httpx.HTTPError:
                 warnings.append("Could not reach OpenRouter to verify the key.")
-        if any(name in values for name in ("github_token", "github_owner", "github_repo")) and effective("github_token"):
+        if any(name in values for name in ("github_token", "github_owner", "github_repo", "github_ai_repo")) and effective("github_token"):
             headers = {"Accept": "application/vnd.github+json", "Authorization": f"Bearer {effective('github_token')}", "X-GitHub-Api-Version": "2022-11-28"}
             base = effective("github_api_url").rstrip("/")
             try:
                 response = await client.get(f"{base}/user", headers=headers)
                 if response.status_code in (401, 403):
                     errors.append(f"GitHub rejected this token ({response.status_code}).")
-                elif effective("github_owner") and effective("github_repo"):
-                    repo = await client.get(f"{base}/repos/{effective('github_owner')}/{effective('github_repo')}", headers=headers)
-                    if repo.status_code == 404:
-                        errors.append(f"GitHub cannot find the repository {effective('github_owner')}/{effective('github_repo')}, or the token has no access to it.")
-                    elif not repo.is_error and not (repo.json().get("permissions") or {}).get("admin"):
-                        warnings.append("The token can see the repository but may not be allowed to add collaborators. Invitations need admin access.")
+                elif effective("github_owner"):
+                    for label, repo_name in (("tech assessment", effective("github_repo") or "Tech_Assessment"), ("AI assessment", effective("github_ai_repo") or "AI_Assessment")):
+                        if not repo_name:
+                            continue
+                        repo = await client.get(f"{base}/repos/{effective('github_owner')}/{repo_name}", headers=headers)
+                        if repo.status_code == 404:
+                            errors.append(f"GitHub cannot find the {label} repository {effective('github_owner')}/{repo_name}, or the token has no access to it.")
+                        elif not repo.is_error and not (repo.json().get("permissions") or {}).get("admin"):
+                            warnings.append(f"The token can see {repo_name} but may not be allowed to add collaborators. Invitations need admin access.")
             except httpx.HTTPError:
                 warnings.append("Could not reach GitHub to verify the token.")
     return errors, warnings
@@ -477,7 +526,7 @@ async def check_settings(values: dict) -> tuple[list[str], list[str]]:
 
 # Settings that are checked together against one outside service. A wrong value in one group never stops another group from being saved.
 SETTING_GROUPS = {
-    "GitHub": {"github_token", "github_owner", "github_repo", "github_api_url"},
+    "GitHub": {"github_token", "github_owner", "github_repo", "github_ai_repo", "github_api_url"},
     "Supabase": {"supabase_url", "supabase_key", "supabase_table"},
     "OpenRouter": {"openrouter_api_key", "openrouter_model", "openrouter_base_url"},
 }
@@ -1283,22 +1332,22 @@ async def admin_overview() -> dict:
     with connection() as conn:
         accounts = conn.execute("SELECT id, label, paused, last_seen, created_at FROM accounts ORDER BY created_at").fetchall()
     rows = [account_overview(a["id"], a["label"], bool(a["paused"]), a["last_seen"]) for a in accounts]
+    # Mirror: Control center only lists extensions that are currently alive (heartbeating).
+    online_rows = [r for r in rows if r["extension_online"]]
     ledger_error = None
     try:
         ledger_ready = await SupabaseLedger().status_ready()
     except Exception as exc:
         ledger_ready, ledger_error = None, ledger_problem(exc) if settings.supabase_url and settings.supabase_key else None
-    online_rows = [r for r in rows if r["extension_online"]]
-    # Totals for the main cards follow live extensions; offline profiles stay listed so they can be removed.
-    totals = {"accounts": len(online_rows), "offline": len(rows) - len(online_rows), "connected": sum(r["himalayas_authorized"] for r in online_rows),
+    totals = {"accounts": len(online_rows), "offline": 0, "connected": sum(r["himalayas_authorized"] for r in online_rows),
               "paused": sum(r["paused"] for r in online_rows),
-              "automation_running": sum(1 for r in rows if r["automation"]["running"]), "members": sum(r["members"] for r in online_rows),
+              "automation_running": sum(1 for r in online_rows if r["automation"]["running"]), "members": sum(r["members"] for r in online_rows),
               "unread": sum(r.get("unread", 0) for r in online_rows)}
     for status in ("sent", "failed", "skipped"):
         totals[status] = sum(r["by_status"].get(status, 0) for r in online_rows)
     totals["queued"] = sum(r["by_status"].get(s, 0) for r in online_rows for s in ("queued", "scheduled", "approved"))
     return {
-        "server": {"ok": True, "time": utc_now()}, "totals": totals, "accounts": rows,
+        "server": {"ok": True, "time": utc_now()}, "totals": totals, "accounts": online_rows,
         "holds": [{"key": key, "reason": hold["reason"], "since": hold["since"]} for key, hold in holds.items()],
         "checks": {"openrouter_key": bool(settings.openrouter_api_key), "supabase": bool(settings.supabase_url and settings.supabase_key) and not ledger_error, "supabase_error": ledger_error,
                    "ledger_status_ready": ledger_ready, "github": settings_ready()},
@@ -1819,7 +1868,7 @@ async def retry_outage(account: Account) -> dict:
 
 
 @app.get("/api/events")
-async def events(account: Account) -> StreamingResponse:
+async def events(account: StreamAccount) -> StreamingResponse:
     queue: asyncio.Queue = asyncio.Queue(maxsize=20)
     dashboard_subscribers[queue] = account
 

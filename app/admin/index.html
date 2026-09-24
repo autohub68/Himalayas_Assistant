@@ -41,7 +41,7 @@
     <div id="totals" class="cards"></div>
     <div id="accounts" class="accounts"></div>
     <p id="accounts-offline-note" class="note" hidden></p>
-    <p id="accounts-empty" class="empty" hidden>No extension has connected yet. Load the extension in a Chrome profile and open its popup. It appears here automatically.</p>
+    <p id="accounts-empty" class="empty" hidden>No Chrome extension is online. Load the extension in a Chrome profile — it appears here within a few seconds. Remove the extension and its card disappears.</p>
   </section>
 
   <!-- ===== One account ===== -->
@@ -183,7 +183,8 @@
       <h3>GitHub assessment access</h3>
       <label for="github_token">GitHub token</label><input id="github_token" type="text" autocomplete="off" spellcheck="false" class="secret">
       <label for="github_owner">Repository owner</label><input id="github_owner" type="text">
-      <label for="github_repo">Repository name</label><input id="github_repo" type="text">
+      <label for="github_repo">Tech assessment repository</label><input id="github_repo" type="text" placeholder="Tech_Assessment"><p class="note">Full Stack, Backend and Frontend developers are invited here.</p>
+      <label for="github_ai_repo">AI assessment repository</label><input id="github_ai_repo" type="text" placeholder="AI_Assessment"><p class="note">AI Developer candidates are invited here.</p>
       <h3>Sending</h3>
       <label for="daily_dm_limit">Daily DM limit (new members per profile per day)</label><input id="daily_dm_limit" type="number" min="0" max="100000" placeholder="0 = no limit"><p class="note">New members this profile messages each day. Replies to members who answered are not counted and are never blocked. Each profile has its own count. The day resets at 00:00 UTC. 0 means no limit.</p><label for="min_message_delay_seconds">Shortest gap between first messages (seconds)</label><input id="min_message_delay_seconds" type="number" min="5"><label for="max_message_delay_seconds">Longest gap between first messages (seconds)</label><input id="max_message_delay_seconds" type="number" min="5"><p class="note">Each gap is a random value between the two. A refusal by Himalayas never changes it.</p>
       <button id="save-settings" class="save">Save settings</button>

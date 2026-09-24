@@ -1,5 +1,5 @@
 // Full-page database dashboard: table structure, every reached member with status, member details, and cleanup.
-const API = 'http://localhost:8765';
+const API = 'http://127.0.0.1:8765';
 const $ = (id) => document.getElementById(id);
 const escapeHtml = (value) => String(value ?? '').replace(/[&<>'"]/g, (character) => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'}[character]));
 
@@ -22,7 +22,7 @@ async function request(path, options = {}) {
 const errorText = (error) => { try { return JSON.parse(error.message).detail || error.message; } catch (parseError) { return error.message; } };
 
 const STATUS_LABELS = {sent: 'Sent', failed: 'Failed', scheduled: 'Queued', approved: 'Approved', queued: 'Queued', skipped: 'Skipped', received: 'Received'};
-const STAGE_LABELS = {first_sent: 'Message 1 sent', intro_sent: 'Introduced', process_sent: 'Process explained', assessment_sent: 'Assessment sent', invite_pending: 'Invite pending', invited: 'GitHub invited', apply_sent: 'Application link sent', closed: 'Closed'};
+const STAGE_LABELS = {first_sent: 'Message 1 sent', intro_sent: 'Introduced', experience_sent: 'Experience asked', process_sent: 'Process explained', assessment_sent: 'Assessment sent', invite_pending: 'Invite pending', invited: 'GitHub invited', apply_sent: 'Application link sent', closed: 'Closed'};
 const statusLabel = (status) => STATUS_LABELS[status] || status;
 const stageLabel = (stage) => (stage ? (STAGE_LABELS[stage] || (/^step_(\d+)$/.test(stage) ? `Message ${stage.slice(5)} sent` : stage)) : 'Not sent yet');
 const formatDate = (value) => (value ? new Date(value).toLocaleString([], {dateStyle: 'medium', timeStyle: 'short'}) : '—');

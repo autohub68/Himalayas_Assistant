@@ -1,6 +1,6 @@
 // Single owner of the Chrome-profile account id. Popup and database pages ask for
 // it; they must not mint their own, or two IDs race into the Control center.
-const API = 'http://localhost:8765';
+const API = 'http://127.0.0.1:8765';
 const ALARM = 'him-heartbeat';
 
 let accountIdPromise = null;
@@ -24,9 +24,24 @@ function ensureAccountId() {
   return accountIdPromise;
 }
 
+function setUninstallHook(accountId) {
+  // Chrome opens this URL when the extension is uninstalled, so the Control center
+  // can mark the profile offline immediately instead of waiting for a heartbeat timeout.
+  const url = `${API}/api/extension/uninstalled?account_id=${encodeURIComponent(accountId)}`;
+  if (url.length > 255) return;
+  try {
+    chrome.runtime.setUninstallURL(url, () => {
+      void chrome.runtime.lastError;
+    });
+  } catch (error) {
+    // Older Chrome builds may reject; heartbeat timeout remains as fallback.
+  }
+}
+
 async function heartbeat() {
   try {
     const id = await ensureAccountId();
+    setUninstallHook(id);
     await fetch(`${API}/api/health`, {headers: {'X-Account-Id': id}});
   } catch (error) {
     // Backend may be down; try again on the next alarm.
@@ -35,7 +50,10 @@ async function heartbeat() {
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message && message.type === 'getAccountId') {
-    ensureAccountId().then((accountId) => sendResponse({accountId})).catch(() => sendResponse({accountId: ''}));
+    ensureAccountId().then((accountId) => {
+      setUninstallHook(accountId);
+      sendResponse({accountId});
+    }).catch(() => sendResponse({accountId: ''}));
     return true;
   }
   return false;

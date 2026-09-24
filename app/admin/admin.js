@@ -30,7 +30,7 @@ function timeUntil(value) {
   return `in ${(seconds / 3600).toFixed(1)} h`;
 }
 const STATUS_LABELS = {sent: 'Sent', failed: 'Failed', scheduled: 'Queued', approved: 'Approved', queued: 'Queued', skipped: 'Skipped', received: 'Received'};
-const STAGE_LABELS = {first_sent: 'Message 1 sent', intro_sent: 'Introduced', process_sent: 'Process explained', assessment_sent: 'Assessment sent', invite_pending: 'Invite pending', invited: 'GitHub invited', apply_sent: 'Application link sent', closed: 'Closed'};
+const STAGE_LABELS = {first_sent: 'Message 1 sent', intro_sent: 'Introduced', experience_sent: 'Experience asked', process_sent: 'Process explained', assessment_sent: 'Assessment sent', invite_pending: 'Invite pending', invited: 'GitHub invited', apply_sent: 'Application link sent', closed: 'Closed'};
 const statusLabel = (status) => STATUS_LABELS[status] || status;
 const stageLabel = (stage) => (stage ? (STAGE_LABELS[stage] || (/^step_(\d+)$/.test(stage) ? `Message ${stage.slice(5)} sent` : stage)) : 'Not sent yet');
 const tag = (status, label) => `<span class="tag ${escapeHtml(status)}">${escapeHtml(label || statusLabel(status))}</span>`;
@@ -83,7 +83,7 @@ function markOffline(error) {
 // ---------- accounts overview ----------
 function card(label, value, cls = '') { return `<div class="card ${cls}"><span>${escapeHtml(label)}</span><strong>${value}</strong></div>`; }
 function renderTotals(t) {
-  $('totals').innerHTML = card('Accounts', t.accounts) + (t.offline ? card('Offline', t.offline, 'failed') : '') + card('Connected', `${t.connected}/${t.accounts}`) + card('Automations running', t.automation_running) + card('Sending paused', t.paused) +
+  $('totals').innerHTML = card('Accounts', t.accounts) + card('Connected', `${t.connected}/${t.accounts}`) + card('Automations running', t.automation_running) + card('Sending paused', t.paused) +
     card('Members reached', t.members) + card('Sent', t.sent, 'sent') + card('Failed', t.failed, 'failed') + card('Queued', t.queued, 'queued') +
     (t.unread ? card('Unread replies', t.unread, 'failed') : '');
 }
@@ -110,32 +110,24 @@ function accountCard(account) {
   const wait = Math.max(0, (new Date(account.next_send_at).getTime() - Date.now()) / 1000, account.next_send_in || 0);
   const next = account.next_recipient ? `${escapeHtml(account.next_recipient)} · ${wait < 3 ? 'now' : `in ${Math.round(wait)}s`}` : '—';
   const unread = account.unread || 0;
-  const online = !!account.extension_online;
-  return `<article class="acct${unread ? ' attention' : ''}${online ? '' : ' offline'}" data-id="${escapeHtml(account.id)}">
-    <div class="acct-head"><div><div class="acct-name" data-open="${escapeHtml(account.id)}"><span class="dot ${online ? 'on' : 'off'}"></span>${escapeHtml(account.label || 'Unnamed profile')}</div><div class="acct-id">${escapeHtml(account.id.slice(0, 10))}… · ${online ? `seen ${escapeHtml(timeAgo(account.last_seen))}` : `extension offline · last seen ${escapeHtml(timeAgo(account.last_seen))}`}</div></div><div class="acct-head-right">${unread ? `<span class="acct-unread" title="${unread} unread ${unread === 1 ? 'reply' : 'replies'}">${unread}</span>` : ''}${!online ? '<span class="pill bad">Extension offline</span>' : account.paused ? '<span class="pill warn">Paused</span>' : account.automation.running ? '<span class="pill ok">Running</span>' : ''}</div></div>
+  return `<article class="acct${unread ? ' attention' : ''}" data-id="${escapeHtml(account.id)}">
+    <div class="acct-head"><div><div class="acct-name" data-open="${escapeHtml(account.id)}"><span class="dot on"></span>${escapeHtml(account.label || 'Unnamed profile')}</div><div class="acct-id">${escapeHtml(account.id.slice(0, 10))}… · seen ${escapeHtml(timeAgo(account.last_seen))}</div></div><div class="acct-head-right">${unread ? `<span class="acct-unread" title="${unread} unread ${unread === 1 ? 'reply' : 'replies'}">${unread}</span>` : ''}${account.paused ? '<span class="pill warn">Paused</span>' : account.automation.running ? '<span class="pill ok">Running</span>' : '<span class="pill ok">Extension online</span>'}</div></div>
     <div class="nums"><div><b>${account.members}</b><span>Members</span></div><div class="sent"><b>${b.sent || 0}</b><span>Sent</span></div><div class="failed"><b>${b.failed || 0}</b><span>Failed</span></div><div class="queued"><b>${queued}</b><span>Queued</span></div></div>
-    <div class="lines"><div><span>Extension</span><span>${online ? 'Online' : 'Offline / removed'}</span></div><div><span>Himalayas</span><span>${account.himalayas_login === 'none' ? 'Not connected' : loginExpired(account) ? 'Login expired' : 'Connected'}</span></div><div><span>Automation</span><span>${escapeHtml(automationText(account))}</span></div><div><span>Sending</span><span>${escapeHtml(sendingText(account))}</span></div><div><span>Today</span><span>${escapeHtml(account.daily && account.daily.limit ? `${account.daily.sent_today} / ${account.daily.limit}` : `${account.daily ? account.daily.sent_today : 0} (no limit)`)}</span></div><div><span>Replies</span><span>${account.replied} replied${unread ? ` · ${unread} unread` : ''} · ${escapeHtml(shortStatus(account.reply_monitor.status))}</span></div><div><span>Next message</span><span>${next}</span></div></div>
+    <div class="lines"><div><span>Extension</span><span>Online</span></div><div><span>Himalayas</span><span>${account.himalayas_login === 'none' ? 'Not connected' : loginExpired(account) ? 'Login expired' : 'Connected'}</span></div><div><span>Automation</span><span>${escapeHtml(automationText(account))}</span></div><div><span>Sending</span><span>${escapeHtml(sendingText(account))}</span></div><div><span>Today</span><span>${escapeHtml(account.daily && account.daily.limit ? `${account.daily.sent_today} / ${account.daily.limit}` : `${account.daily ? account.daily.sent_today : 0} (no limit)`)}</span></div><div><span>Replies</span><span>${account.replied} replied${unread ? ` · ${unread} unread` : ''} · ${escapeHtml(shortStatus(account.reply_monitor.status))}</span></div><div><span>Next message</span><span>${next}</span></div></div>
     <div class="acct-actions">
       <button data-open="${escapeHtml(account.id)}" ${unread ? 'data-open-members="1"' : ''}>${unread ? `Open members (${unread} unread)` : 'Open'}</button>
       <button class="secondary" data-act="automation" data-id="${escapeHtml(account.id)}" ${!account.himalayas_authorized && !account.automation.running ? 'disabled title="Connect Himalayas first"' : ''}>${account.automation.running ? 'Stop automation' : 'Start automation'}</button>
       <button class="secondary" data-act="pause" data-id="${escapeHtml(account.id)}">${account.paused ? 'Resume sending' : 'Pause sending'}</button>
       ${account.himalayas_authorized ? '' : `<a class="button-link attention" target="_blank" rel="noopener" href="/api/auth/start?account_id=${encodeURIComponent(account.id)}">${loginExpired(account) ? 'Reconnect Himalayas' : 'Connect Himalayas'}</a>`}
-      <button class="danger" data-act="remove" data-id="${escapeHtml(account.id)}" title="Stop automation and delete this profile from the Control center">${online ? 'Remove' : 'Remove offline profile'}</button>
+      <button class="danger" data-act="remove" data-id="${escapeHtml(account.id)}" title="Stop automation and delete this profile from the Control center">Remove</button>
     </div></article>`;
 }
 function renderAccounts(overview) {
   renderTotals(overview.totals);
-  const online = overview.accounts.filter((account) => account.extension_online);
-  const offline = overview.accounts.filter((account) => !account.extension_online);
-  $('accounts').innerHTML = online.map(accountCard).join('') + offline.map(accountCard).join('');
+  $('accounts').innerHTML = overview.accounts.map(accountCard).join('');
   $('accounts-empty').hidden = overview.accounts.length > 0;
   const note = $('accounts-offline-note');
-  if (note) {
-    note.hidden = offline.length === 0;
-    note.textContent = offline.length
-      ? `${offline.length} profile${offline.length === 1 ? '' : 's'} with no live Chrome extension. Remove a card to drop it from this dashboard (stops its automation and deletes its local data).`
-      : '';
-  }
+  if (note) note.hidden = true;
   $('accounts').querySelectorAll('[data-open]').forEach((element) => {
     element.onclick = () => openAccount(element.dataset.open, element.dataset.openMembers === '1' ? 'members' : 'overview');
   });
@@ -506,7 +498,7 @@ $('clean-all-text').oninput = () => { $('clean-all').disabled = $('clean-all-tex
 $('clean-all').onclick = () => runCleanup({mode: 'all', confirm: 'DELETE'}, $('clean-all'));
 
 // ---------- shared settings ----------
-const settingFields = ['openrouter_api_key', 'supabase_url', 'supabase_key', 'github_token', 'github_owner', 'github_repo', 'min_message_delay_seconds', 'max_message_delay_seconds', 'daily_dm_limit'];
+const settingFields = ['openrouter_api_key', 'supabase_url', 'supabase_key', 'github_token', 'github_owner', 'github_repo', 'github_ai_repo', 'min_message_delay_seconds', 'max_message_delay_seconds', 'daily_dm_limit'];
 const secretFields = ['openrouter_api_key', 'supabase_key', 'github_token'];
 async function loadSettings() {
   try {

@@ -12,6 +12,10 @@ BARE_PATTERN = re.compile(rf"^@?({USERNAME})[.!]?$")
 NOT_USERNAMES = {"yes", "ok", "okay", "sure", "thanks", "thank", "no", "yeah", "done", "hello", "hi", "please", "agree", "great", "good", "fine", "yep"}
 EMAIL_PATTERN = re.compile(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b")
 
+AI_DEVELOPER_ROLE = "AI Developer"
+TECH_ASSESSMENT_REPO = "Tech_Assessment"
+AI_ASSESSMENT_REPO = "AI_Assessment"
+
 
 class GitHubError(RuntimeError):
     pass
@@ -51,17 +55,25 @@ def api_headers() -> dict:
     return {"Accept": "application/vnd.github+json", "Authorization": f"Bearer {settings.github_token}", "X-GitHub-Api-Version": "2022-11-28"}
 
 
+def repo_for_role(role: str | None = None) -> str:
+    """Assessment repository for the role. AI Developer uses AI_Assessment; every other developer uses Tech_Assessment."""
+    if (role or "").strip() == AI_DEVELOPER_ROLE:
+        return (settings.github_ai_repo or AI_ASSESSMENT_REPO).strip() or AI_ASSESSMENT_REPO
+    return (settings.github_repo or TECH_ASSESSMENT_REPO).strip() or TECH_ASSESSMENT_REPO
+
+
 def settings_ready() -> bool:
-    return bool(settings.github_token and settings.github_owner and settings.github_repo)
+    return bool(settings.github_token and settings.github_owner and repo_for_role("Full Stack Developer") and repo_for_role(AI_DEVELOPER_ROLE))
 
 
-def repository_name() -> str:
-    return f"{settings.github_owner}/{settings.github_repo}"
+def repository_name(role: str | None = None) -> str:
+    return f"{settings.github_owner}/{repo_for_role(role)}"
 
 
-async def invite_to_repository(username: str) -> None:
+async def invite_to_repository(username: str, role: str | None = None) -> None:
     """Check that the account exists, then invite it. Safe to repeat: GitHub ignores a second invitation."""
-    if not settings.github_token or not settings.github_owner or not settings.github_repo:
+    repo = repo_for_role(role)
+    if not settings.github_token or not settings.github_owner or not repo:
         raise GitHubError("GitHub token, owner, and repository are required in Settings")
     base = settings.github_api_url.rstrip("/")
     async with httpx.AsyncClient(timeout=30) as client:
@@ -71,7 +83,7 @@ async def invite_to_repository(username: str) -> None:
         if lookup.is_error:
             raise GitHubError(f"GitHub user lookup failed ({lookup.status_code}): {lookup.text}")
         response = await client.put(
-            f"{base}/repos/{settings.github_owner}/{settings.github_repo}/collaborators/{username}",
+            f"{base}/repos/{settings.github_owner}/{repo}/collaborators/{username}",
             headers=api_headers(),
             json={"permission": "pull"},
         )
