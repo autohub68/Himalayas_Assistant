@@ -83,7 +83,7 @@ function markOffline(error) {
 // ---------- accounts overview ----------
 function card(label, value, cls = '') { return `<div class="card ${cls}"><span>${escapeHtml(label)}</span><strong>${value}</strong></div>`; }
 function renderTotals(t) {
-  $('totals').innerHTML = card('Accounts', t.accounts) + card('Connected', `${t.connected}/${t.accounts}`) + card('Automations running', t.automation_running) + card('Sending paused', t.paused) +
+  $('totals').innerHTML = card('Accounts', t.accounts) + (t.offline ? card('Offline', t.offline, 'failed') : '') + card('Connected', `${t.connected}/${t.accounts}`) + card('Automations running', t.automation_running) + card('Sending paused', t.paused) +
     card('Members reached', t.members) + card('Sent', t.sent, 'sent') + card('Failed', t.failed, 'failed') + card('Queued', t.queued, 'queued') +
     (t.unread ? card('Unread replies', t.unread, 'failed') : '');
 }
@@ -110,21 +110,32 @@ function accountCard(account) {
   const wait = Math.max(0, (new Date(account.next_send_at).getTime() - Date.now()) / 1000, account.next_send_in || 0);
   const next = account.next_recipient ? `${escapeHtml(account.next_recipient)} · ${wait < 3 ? 'now' : `in ${Math.round(wait)}s`}` : '—';
   const unread = account.unread || 0;
-  return `<article class="acct${unread ? ' attention' : ''}" data-id="${escapeHtml(account.id)}">
-    <div class="acct-head"><div><div class="acct-name" data-open="${escapeHtml(account.id)}"><span class="dot ${account.himalayas_authorized ? 'on' : 'off'}"></span>${escapeHtml(account.label || 'Unnamed profile')}</div><div class="acct-id">${escapeHtml(account.id.slice(0, 10))}… · seen ${escapeHtml(timeAgo(account.last_seen))}</div></div><div class="acct-head-right">${unread ? `<span class="acct-unread" title="${unread} unread ${unread === 1 ? 'reply' : 'replies'}">${unread}</span>` : ''}${account.paused ? '<span class="pill warn">Paused</span>' : account.automation.running ? '<span class="pill ok">Running</span>' : ''}</div></div>
+  const online = !!account.extension_online;
+  return `<article class="acct${unread ? ' attention' : ''}${online ? '' : ' offline'}" data-id="${escapeHtml(account.id)}">
+    <div class="acct-head"><div><div class="acct-name" data-open="${escapeHtml(account.id)}"><span class="dot ${online ? 'on' : 'off'}"></span>${escapeHtml(account.label || 'Unnamed profile')}</div><div class="acct-id">${escapeHtml(account.id.slice(0, 10))}… · ${online ? `seen ${escapeHtml(timeAgo(account.last_seen))}` : `extension offline · last seen ${escapeHtml(timeAgo(account.last_seen))}`}</div></div><div class="acct-head-right">${unread ? `<span class="acct-unread" title="${unread} unread ${unread === 1 ? 'reply' : 'replies'}">${unread}</span>` : ''}${!online ? '<span class="pill bad">Extension offline</span>' : account.paused ? '<span class="pill warn">Paused</span>' : account.automation.running ? '<span class="pill ok">Running</span>' : ''}</div></div>
     <div class="nums"><div><b>${account.members}</b><span>Members</span></div><div class="sent"><b>${b.sent || 0}</b><span>Sent</span></div><div class="failed"><b>${b.failed || 0}</b><span>Failed</span></div><div class="queued"><b>${queued}</b><span>Queued</span></div></div>
-    <div class="lines"><div><span>Himalayas</span><span>${account.himalayas_login === 'none' ? 'Not connected' : loginExpired(account) ? 'Login expired' : 'Connected'}</span></div><div><span>Automation</span><span>${escapeHtml(automationText(account))}</span></div><div><span>Sending</span><span>${escapeHtml(sendingText(account))}</span></div><div><span>Today</span><span>${escapeHtml(account.daily && account.daily.limit ? `${account.daily.sent_today} / ${account.daily.limit}` : `${account.daily ? account.daily.sent_today : 0} (no limit)`)}</span></div><div><span>Replies</span><span>${account.replied} replied${unread ? ` · ${unread} unread` : ''} · ${escapeHtml(shortStatus(account.reply_monitor.status))}</span></div><div><span>Next message</span><span>${next}</span></div></div>
+    <div class="lines"><div><span>Extension</span><span>${online ? 'Online' : 'Offline / removed'}</span></div><div><span>Himalayas</span><span>${account.himalayas_login === 'none' ? 'Not connected' : loginExpired(account) ? 'Login expired' : 'Connected'}</span></div><div><span>Automation</span><span>${escapeHtml(automationText(account))}</span></div><div><span>Sending</span><span>${escapeHtml(sendingText(account))}</span></div><div><span>Today</span><span>${escapeHtml(account.daily && account.daily.limit ? `${account.daily.sent_today} / ${account.daily.limit}` : `${account.daily ? account.daily.sent_today : 0} (no limit)`)}</span></div><div><span>Replies</span><span>${account.replied} replied${unread ? ` · ${unread} unread` : ''} · ${escapeHtml(shortStatus(account.reply_monitor.status))}</span></div><div><span>Next message</span><span>${next}</span></div></div>
     <div class="acct-actions">
       <button data-open="${escapeHtml(account.id)}" ${unread ? 'data-open-members="1"' : ''}>${unread ? `Open members (${unread} unread)` : 'Open'}</button>
       <button class="secondary" data-act="automation" data-id="${escapeHtml(account.id)}" ${!account.himalayas_authorized && !account.automation.running ? 'disabled title="Connect Himalayas first"' : ''}>${account.automation.running ? 'Stop automation' : 'Start automation'}</button>
       <button class="secondary" data-act="pause" data-id="${escapeHtml(account.id)}">${account.paused ? 'Resume sending' : 'Pause sending'}</button>
       ${account.himalayas_authorized ? '' : `<a class="button-link attention" target="_blank" rel="noopener" href="/api/auth/start?account_id=${encodeURIComponent(account.id)}">${loginExpired(account) ? 'Reconnect Himalayas' : 'Connect Himalayas'}</a>`}
+      <button class="danger" data-act="remove" data-id="${escapeHtml(account.id)}" title="Stop automation and delete this profile from the Control center">${online ? 'Remove' : 'Remove offline profile'}</button>
     </div></article>`;
 }
 function renderAccounts(overview) {
   renderTotals(overview.totals);
-  $('accounts').innerHTML = overview.accounts.map(accountCard).join('');
+  const online = overview.accounts.filter((account) => account.extension_online);
+  const offline = overview.accounts.filter((account) => !account.extension_online);
+  $('accounts').innerHTML = online.map(accountCard).join('') + offline.map(accountCard).join('');
   $('accounts-empty').hidden = overview.accounts.length > 0;
+  const note = $('accounts-offline-note');
+  if (note) {
+    note.hidden = offline.length === 0;
+    note.textContent = offline.length
+      ? `${offline.length} profile${offline.length === 1 ? '' : 's'} with no live Chrome extension. Remove a card to drop it from this dashboard (stops its automation and deletes its local data).`
+      : '';
+  }
   $('accounts').querySelectorAll('[data-open]').forEach((element) => {
     element.onclick = () => openAccount(element.dataset.open, element.dataset.openMembers === '1' ? 'members' : 'overview');
   });
@@ -135,6 +146,15 @@ async function accountAction(id, action) {
   const account = state.overview.accounts.find((item) => item.id === id);
   if (!account) return;
   try {
+    if (action === 'remove') {
+      const name = account.label || account.id.slice(0, 8);
+      if (!confirm(`Remove “${name}” from the Control center?\n\nThis stops its automation and deletes its local members, messages and Himalayas login on this server. The shared contact ledger is not changed.`)) return;
+      await api(`/api/admin/accounts/${encodeURIComponent(id)}`, {method: 'DELETE'});
+      if (state.accountId === id) { state.accountId = null; showView('accounts'); }
+      toast(`${name}: removed.`);
+      await loadOverview();
+      return;
+    }
     if (action === 'automation') await api(account.automation.running ? '/api/automation/stop' : '/api/automation/start', {method: 'POST'}, id);
     if (action === 'pause') await api(`/api/admin/accounts/${encodeURIComponent(id)}/pause`, {method: 'POST', body: JSON.stringify({paused: !account.paused})});
     toast(`${account.label || 'Profile'}: ${action === 'pause' ? (account.paused ? 'sending resumed' : 'sending paused') : (account.automation.running ? 'automation stopping' : 'automation starting')}.`);
@@ -187,7 +207,7 @@ function renderAccountHead() {
   const account = currentAccount();
   if (!account) return;
   if (document.activeElement !== $('account-label')) $('account-label').value = account.label || '';
-  $('account-meta').textContent = `Account ${account.id} · last seen ${timeAgo(account.last_seen)} · ${account.himalayas_login === 'connected' ? 'Himalayas connected' : account.himalayas_login === 'expired' ? 'Himalayas login expired' : 'Himalayas not connected'}`;
+  $('account-meta').textContent = `Account ${account.id} · extension ${account.extension_online ? 'online' : 'offline'} · last seen ${timeAgo(account.last_seen)} · ${account.himalayas_login === 'connected' ? 'Himalayas connected' : account.himalayas_login === 'expired' ? 'Himalayas login expired' : 'Himalayas not connected'}`;
   $('a-automation').textContent = account.automation.running ? 'Stop automation' : 'Start automation';
   $('a-automation').className = account.automation.running ? 'warn' : '';
   $('a-automation').disabled = !account.himalayas_authorized && !account.automation.running;

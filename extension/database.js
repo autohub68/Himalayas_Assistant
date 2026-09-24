@@ -3,10 +3,13 @@ const API = 'http://localhost:8765';
 const $ = (id) => document.getElementById(id);
 const escapeHtml = (value) => String(value ?? '').replace(/[&<>'"]/g, (character) => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'}[character]));
 
-// Each Chrome profile has its own account id (same value the popup uses), so this page shows this profile's data.
+// Each Chrome profile has its own account id (minted only by the service worker).
 const accountReady = new Promise((resolve) => {
   try {
-    chrome.storage.local.get('accountId', (stored) => resolve(stored && stored.accountId ? stored.accountId : ''));
+    chrome.runtime.sendMessage({type: 'getAccountId'}, (response) => {
+      if (response && response.accountId) return resolve(response.accountId);
+      chrome.storage.local.get('accountId', (stored) => resolve(stored && stored.accountId ? stored.accountId : ''));
+    });
   } catch (error) { resolve(''); }
 });
 async function request(path, options = {}) {

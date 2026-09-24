@@ -74,6 +74,7 @@ label{display:block;margin:10px 0 4px;color:var(--muted);font:10px 'DM Mono',mon
 .accounts{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:16px}
 .acct{border:1px solid var(--line);border-radius:12px;background:var(--panel);padding:16px;display:grid;gap:12px;align-content:start}
 .acct.attention{border-color:#6b4a2a}
+.acct.offline{opacity:.72;border-style:dashed}
 .acct-head{display:flex;justify-content:space-between;align-items:flex-start;gap:10px}
 .acct-head-right{display:flex;align-items:center;gap:8px;flex-shrink:0}
 .acct-name{font-size:15px;font-weight:800;cursor:pointer}

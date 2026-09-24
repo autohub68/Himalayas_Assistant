@@ -5,16 +5,21 @@ let refreshing = false;
 let selectedConversation = null;
 const escapeHtml = (value) => String(value ?? '').replace(/[&<>'"]/g, (character) => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'}[character]));
 // Every Chrome profile has its own extension storage, so each profile gets its own account id.
-// The single shared backend uses it to keep logins, candidates, queues and replies separate.
-const accountReady = new Promise((resolve) => {
-  const create = () => (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2)).replace(/[^A-Za-z0-9]/g, '');
-  const fallback = create();
+// The service worker is the only place that creates it (avoids a race that registered two profiles).
+const accountReady = new Promise((resolve, reject) => {
   try {
-    chrome.storage.local.get('accountId', (stored) => {
-      if (stored && stored.accountId) return resolve(stored.accountId);
-      chrome.storage.local.set({accountId: fallback}, () => resolve(fallback));
+    chrome.runtime.sendMessage({type: 'getAccountId'}, (response) => {
+      if (chrome.runtime.lastError) {
+        chrome.storage.local.get('accountId', (stored) => {
+          if (stored && stored.accountId) resolve(stored.accountId);
+          else reject(new Error(chrome.runtime.lastError.message));
+        });
+        return;
+      }
+      if (response && response.accountId) resolve(response.accountId);
+      else reject(new Error('No account id from extension service worker'));
     });
-  } catch (error) { resolve(fallback); }
+  } catch (error) { reject(error); }
 });
 async function request(path, options = {}) {
   const accountId = await accountReady;

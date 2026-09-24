@@ -21,7 +21,7 @@ from . import chat, playbook, prompted
 from .ai import classify, write_first_message
 from .config import settings
 from .github import settings_ready
-from .db import ACCOUNT_ID_PATTERN, backup_database, connection, ensure_account, get_state, init_db, set_state, utc_now, vacuum
+from .db import ACCOUNT_ID_PATTERN, backup_database, connection, ensure_account, get_state, init_db, known_accounts, set_state, utc_now, vacuum
 from .mcp_client import result_text, AlreadyMessaged, ConversationUnavailable, HimalayasMCP, HimalayasUnavailable, letters_only, HimalayasRejected, LoginExpired, MCPError, authorization_url, authorized_accounts, exchange_code, login_state, oauth_status
 from .supabase_client import SupabaseError, SupabaseLedger
 
@@ -145,6 +145,8 @@ def delivery_state(account_id: str) -> dict:
 
 
 last_seen_written: dict[str, float] = {}
+# Extension heartbeats about every 30s. Past this, the Control center treats the Chrome extension as gone.
+EXTENSION_ONLINE_SECONDS = 120
 
 
 def touch_seen(account_id: str) -> None:
@@ -155,6 +157,18 @@ def touch_seen(account_id: str) -> None:
     last_seen_written[account_id] = now
     with connection() as conn:
         conn.execute("UPDATE accounts SET last_seen=? WHERE id=?", (utc_now(), account_id))
+
+
+def extension_online(last_seen: str | None) -> bool:
+    if not last_seen:
+        return False
+    try:
+        seen = datetime.fromisoformat(last_seen)
+    except ValueError:
+        return False
+    if seen.tzinfo is None:
+        seen = seen.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - seen).total_seconds() <= EXTENSION_ONLINE_SECONDS
 
 
 def optional_account(
@@ -1160,8 +1174,12 @@ def account_overview(account_id: str, label: str, paused: bool, last_seen: str |
         alerts.append(f"Waiting for Himalayas to answer ({str(monitor["status"]).splitlines()[0][22:120].strip()}). Replies are checked again every {settings.reply_poll_interval_seconds} seconds")
     elif str(monitor["status"]).startswith("failed") and authorized:
         alerts.append(f"Reply monitor failed: {str(monitor['status']).splitlines()[0][8:140]}")
+    online = extension_online(last_seen)
+    if not online:
+        alerts.insert(0, "Chrome extension offline or removed")
     return {
-        "id": account_id, "label": label, "paused": paused, "last_seen": last_seen, "himalayas_authorized": authorized, "himalayas_login": login,
+        "id": account_id, "label": label, "paused": paused, "last_seen": last_seen, "extension_online": online,
+        "himalayas_authorized": authorized, "himalayas_login": login,
         "automation": automation, "delivery": delivery_state(account_id), "reply_monitor": monitor, "daily": today,
         "imported": imported, "members": len(members), "by_status": by_status,
         "replied": sum(1 for m in members if m["replies"]), "failed_followups": failed_followups, "unread": unread,
@@ -1261,6 +1279,7 @@ async def reset_playbook() -> dict:
 
 @app.get("/api/admin/overview")
 async def admin_overview() -> dict:
+    prune_empty_orphan_accounts()
     with connection() as conn:
         accounts = conn.execute("SELECT id, label, paused, last_seen, created_at FROM accounts ORDER BY created_at").fetchall()
     rows = [account_overview(a["id"], a["label"], bool(a["paused"]), a["last_seen"]) for a in accounts]
@@ -1269,12 +1288,15 @@ async def admin_overview() -> dict:
         ledger_ready = await SupabaseLedger().status_ready()
     except Exception as exc:
         ledger_ready, ledger_error = None, ledger_problem(exc) if settings.supabase_url and settings.supabase_key else None
-    totals = {"accounts": len(rows), "connected": sum(r["himalayas_authorized"] for r in rows), "paused": sum(r["paused"] for r in rows),
-              "automation_running": sum(1 for r in rows if r["automation"]["running"]), "members": sum(r["members"] for r in rows),
-              "unread": sum(r.get("unread", 0) for r in rows)}
+    online_rows = [r for r in rows if r["extension_online"]]
+    # Totals for the main cards follow live extensions; offline profiles stay listed so they can be removed.
+    totals = {"accounts": len(online_rows), "offline": len(rows) - len(online_rows), "connected": sum(r["himalayas_authorized"] for r in online_rows),
+              "paused": sum(r["paused"] for r in online_rows),
+              "automation_running": sum(1 for r in rows if r["automation"]["running"]), "members": sum(r["members"] for r in online_rows),
+              "unread": sum(r.get("unread", 0) for r in online_rows)}
     for status in ("sent", "failed", "skipped"):
-        totals[status] = sum(r["by_status"].get(status, 0) for r in rows)
-    totals["queued"] = sum(r["by_status"].get(s, 0) for r in rows for s in ("queued", "scheduled", "approved"))
+        totals[status] = sum(r["by_status"].get(status, 0) for r in online_rows)
+    totals["queued"] = sum(r["by_status"].get(s, 0) for r in online_rows for s in ("queued", "scheduled", "approved"))
     return {
         "server": {"ok": True, "time": utc_now()}, "totals": totals, "accounts": rows,
         "holds": [{"key": key, "reason": hold["reason"], "since": hold["since"]} for key, hold in holds.items()],
@@ -1301,6 +1323,73 @@ async def admin_pause(account_id: str, request: PauseRequest) -> dict:
         next_reply_at.pop(account_id, None)
     publish_dashboard_update("paused" if request.paused else "resumed", account_id)
     return {"id": account_id, "paused": request.paused}
+
+
+def clear_account_runtime(account_id: str) -> None:
+    """Drop in-memory state for a profile that is being removed from the Control center."""
+    task = automation_tasks.pop(account_id, None)
+    if task and not task.done():
+        task.cancel()
+    for store in (automation_states, reply_monitor_states, delivery_states, last_seen_written, loop_crashes,
+                  next_first_message_at, refusal_times, rejection_streak, next_reply_at, outage_step, verify_locks):
+        store.pop(account_id, None)
+    holds.pop(account_id, None)
+    holds.pop("first:" + account_id, None)
+    known_accounts.discard(account_id)
+
+
+def delete_account_data(account_id: str) -> bool:
+    """Stop automation and erase one profile's local rows. Returns False if the account was already gone."""
+    remember_automation(account_id, None)
+    clear_account_runtime(account_id)
+    with connection() as conn:
+        if not conn.execute("SELECT 1 FROM accounts WHERE id=?", (account_id,)).fetchone():
+            return False
+        candidate_ids = [row[0] for row in conn.execute("SELECT id FROM candidates WHERE account_id=?", (account_id,))]
+        if candidate_ids:
+            placeholders = ",".join("?" * len(candidate_ids))
+            conn.execute(f"DELETE FROM himalayas_check WHERE candidate_id IN ({placeholders})", candidate_ids)
+            conn.execute(f"DELETE FROM messages WHERE candidate_id IN ({placeholders})", candidate_ids)
+        conn.execute("DELETE FROM messages WHERE account_id=?", (account_id,))
+        conn.execute("DELETE FROM candidates WHERE account_id=?", (account_id,))
+        conn.execute("DELETE FROM oauth_tokens WHERE account_id=?", (account_id,))
+        conn.execute("DELETE FROM oauth_state WHERE account_id=?", (account_id,))
+        conn.execute("DELETE FROM processed_inbound WHERE account_id=?", (account_id,))
+        conn.execute("DELETE FROM app_state WHERE key LIKE ?", (f"%{account_id}%",))
+        conn.execute("DELETE FROM accounts WHERE id=?", (account_id,))
+    return True
+
+
+def prune_empty_orphan_accounts() -> list[str]:
+    """Drop unused offline profiles (no members, never logged in). Typical cause: popup and service worker
+    each minted an account id on first install before storage settled."""
+    removed: list[str] = []
+    with connection() as conn:
+        rows = conn.execute("SELECT id, last_seen FROM accounts").fetchall()
+        for row in rows:
+            if extension_online(row["last_seen"]):
+                continue
+            if conn.execute("SELECT 1 FROM candidates WHERE account_id=? LIMIT 1", (row["id"],)).fetchone():
+                continue
+            token = conn.execute("SELECT access_token FROM oauth_tokens WHERE account_id=?", (row["id"],)).fetchone()
+            if token and token["access_token"]:
+                continue
+            removed.append(row["id"])
+    for account_id in removed:
+        if delete_account_data(account_id):
+            publish_dashboard_update("account_removed", account_id)
+    return removed
+
+
+@app.delete("/api/admin/accounts/{account_id}")
+async def admin_delete_account(account_id: str) -> dict:
+    """Remove a Chrome profile from the Control center. Stops its automation and deletes its local data."""
+    if not ACCOUNT_ID_PATTERN.match(account_id):
+        raise HTTPException(status_code=400, detail="Invalid account id")
+    if not delete_account_data(account_id):
+        raise HTTPException(status_code=404, detail="Account not found")
+    publish_dashboard_update("account_removed", account_id)
+    return {"ok": True, "id": account_id}
 
 
 class BulkRequest(BaseModel):

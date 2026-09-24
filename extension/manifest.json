@@ -1,14 +1,18 @@
 {
   "manifest_version": 3,
   "name": "Himalayas Hiring Assistant",
-  "version": "0.1.0",
-  "description": "Review candidates, queue outreach, and manage recruiting conversations.",
+  "version": "0.1.2",
+  "description": "Review candidates, draft outreach, and manage recruiting conversations.",
   "action": {
     "default_popup": "popup.html"
   },
+  "background": {
+    "service_worker": "background.js"
+  },
   "permissions": [
     "storage",
-    "nativeMessaging"
+    "nativeMessaging",
+    "alarms"
   ],
   "host_permissions": [
     "http://localhost:8765/*"
