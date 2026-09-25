@@ -479,7 +479,7 @@ def is_paused(account_id: str) -> bool:
 
 
 class AccountUpdate(BaseModel):
-    label: str | None = Field(default=None, max_length=60)
+    label: str | None = Field(default=None, max_length=120)
     hiring_client_description: str | None = Field(default=None, max_length=4000)
 
 
@@ -1641,6 +1641,16 @@ class LoginRequest(BaseModel):
 @app.get("/login")
 async def login_page() -> HTMLResponse:
     return HTMLResponse((ADMIN_DIR / "login.html").read_text(encoding="utf-8"), headers={"Cache-Control": "no-store"})
+
+
+@app.get("/admin")
+@app.get("/admin/")
+async def admin_index() -> HTMLResponse:
+    """Serve the dashboard shell with no-cache so JS/CSS updates are picked up after deploy."""
+    return HTMLResponse(
+        (ADMIN_DIR / "index.html").read_text(encoding="utf-8"),
+        headers={"Cache-Control": "no-store, max-age=0", "Pragma": "no-cache"},
+    )
 
 
 @app.post("/api/login")

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Control center · Hiring Assistant</title>
-  <link rel="stylesheet" href="admin.css">
+  <link rel="stylesheet" href="admin.css?v=20260926a">
 </head>
 <body>
   <header class="top">
@@ -62,7 +62,7 @@
           <button id="ledger-refresh" class="secondary">Refresh</button>
         </div>
       </div>
-      <p id="ledger-note" class="note">All members in Supabase <b>talent_profiles</b> (not sent, queued, sent, failed, skip). Same table bots use for first outreach.</p>
+      <p id="ledger-note" class="note">All members in Supabase <b>talent_profiles</b> (not sent, sent, failed, skip). Same table bots use for first outreach.</p>
       <div class="table-wrap">
         <table id="ledger-table">
           <thead><tr>
@@ -80,7 +80,7 @@
     <button id="back" class="link">← All accounts</button>
     <div class="panel account-head">
       <div class="account-title">
-        <input id="account-label" type="text" maxlength="60" placeholder="Name this profile (e.g. Recruiter A)">
+        <input id="account-label" type="text" maxlength="120" placeholder="Name this profile (e.g. Recruiter A)">
         <button id="account-save" class="secondary">Save name</button>
       </div>
       <p id="account-meta" class="muted"></p>
@@ -236,6 +236,6 @@
     <div id="detail-body" class="detail-body"></div>
   </aside>
 
-  <script src="admin.js"></script>
+  <script src="admin.js?v=20260926a"></script>
 </body>
 </html>

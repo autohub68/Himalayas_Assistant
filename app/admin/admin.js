@@ -10,7 +10,17 @@ async function api(path, options = {}, accountId = null) {
   if (!response.ok) throw new Error(await response.text());
   return response.json();
 }
-const errorText = (error) => { try { return JSON.parse(error.message).detail || error.message; } catch (parseError) { return error.message; } };
+const errorText = (error) => {
+  try {
+    const detail = JSON.parse(error.message).detail;
+    if (Array.isArray(detail)) {
+      return detail.map((item) => item.msg || item.message || JSON.stringify(item)).join(' ');
+    }
+    return detail || error.message;
+  } catch (parseError) {
+    return error.message;
+  }
+};
 const plural = (count, word) => `${count} ${word}${count === 1 ? '' : 's'}`;
 const formatDate = (value) => (value ? new Date(value).toLocaleString([], {dateStyle: 'medium', timeStyle: 'short'}) : '—');
 function timeAgo(value) {
@@ -84,8 +94,9 @@ function markOffline(error) {
 // ---------- accounts overview ----------
 function card(label, value, cls = '') { return `<div class="card ${cls}"><span>${escapeHtml(label)}</span><strong>${value}</strong></div>`; }
 function renderTotals(t) {
-  $('totals').innerHTML = card('Accounts', t.accounts) + card('Connected', `${t.connected}/${t.accounts}`) + card('Automations running', t.automation_running) + card('Sending paused', t.paused) +
-    card('Sent', t.sent || 0, 'sent') + card('Failed', t.failed || 0, 'failed') + card('Skipped', t.skipped || 0);
+  t = t || {};
+  $('totals').innerHTML = card('Accounts', t.accounts ?? 0) + card('Connected', `${t.connected ?? 0}/${t.accounts ?? 0}`) + card('Automations running', t.automation_running ?? 0) + card('Sending paused', t.paused ?? 0) +
+    card('Sent', t.sent ?? 0, 'sent') + card('Failed', t.failed ?? 0, 'failed') + card('Skipped', t.skipped ?? 0);
 }
 const shortStatus = (text) => { const line = String(text || '').split('\n')[0]; return line.length > 60 ? `${line.slice(0, 57)}…` : line; };
 function automationText(account) {
@@ -178,7 +189,14 @@ $('all-resume').onclick = () => bulk('resume');
 
 async function loadOverview() {
   try {
+    const previous = state.overview && state.overview.accounts
+      ? state.overview.accounts.find((account) => account.id === state.accountId)
+      : null;
     state.overview = await api('/api/admin/overview');
+    // Keep the open account available for Save name / head even if a heartbeat briefly drops it from the online list.
+    if (previous && state.accountId && !state.overview.accounts.some((account) => account.id === state.accountId)) {
+      state.overview.accounts = [...state.overview.accounts, previous];
+    }
     renderHeader(state.overview);
     renderAccounts(state.overview);
     if (state.view === 'account') { renderAccountHead(); loadAccountTab(); }
@@ -250,8 +268,31 @@ function updateUnreadBadge(unread) {
   badge.textContent = unread;
 }
 $('account-save').onclick = async () => {
-  try { await api('/api/account', {method: 'PUT', body: JSON.stringify({label: $('account-label').value.trim()})}, state.accountId); toast('Name saved.'); } catch (error) { toast(`Could not save: ${errorText(error)}`, true); }
-  await loadOverview();
+  if (!state.accountId) {
+    toast('Open a bot account first.', true);
+    return;
+  }
+  const label = $('account-label').value.trim();
+  if (!label) {
+    toast('Enter a profile name first.', true);
+    return;
+  }
+  try {
+    const info = await api('/api/account', {method: 'PUT', body: JSON.stringify({label})}, state.accountId);
+    // Keep the open account in local overview state so the name does not snap back after refresh.
+    if (state.overview && Array.isArray(state.overview.accounts)) {
+      const row = state.overview.accounts.find((account) => account.id === state.accountId);
+      if (row) row.label = info.label || label;
+    }
+    $('account-label').value = info.label || label;
+    toast(`Name saved: ${info.label || label}`);
+  } catch (error) {
+    toast(`Could not save name: ${errorText(error)}`, true);
+    return;
+  }
+  try {
+    await loadOverview();
+  } catch (error) { /* overview refresh is best-effort; name already saved */ }
 };
 async function loadHiringClient(accountId) {
   try {
@@ -624,7 +665,6 @@ function renderLedgerChips() {
   $('ledger-chips').innerHTML =
     ledgerChip('', 'All') +
     ledgerChip('not_sent', 'Not sent') +
-    ledgerChip('queued', 'Queued') +
     ledgerChip('sent', 'Sent') +
     ledgerChip('failed', 'Failed') +
     ledgerChip('skip', 'Skip');
