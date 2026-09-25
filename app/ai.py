@@ -275,8 +275,49 @@ def parse_json(text: str) -> dict:
     return json.loads(match.group(0))
 
 
+# Email-style leftovers models invent for "outreach" (Himalayas is an in-app DM, not email).
+BRACKET_PLACEHOLDER = re.compile(r"\[[^\]\n]{1,40}\]")
+EMAIL_SIGNOFF = re.compile(
+    r"\s+(?:best(?:\s+regards)?|kind\s+regards|regards|sincerely|cheers|thanks)\s*,?\s*"
+    r"(?:\[[^\]]+\]|[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)?\s*$",
+    re.IGNORECASE,
+)
+
+
+def strip_email_artifacts(text: str) -> str:
+    """Remove Subject: lines, bracket placeholders, and email-style sign-offs from a chat DM."""
+    out = (text or "").strip()
+    # Subject on its own line (requires a following newline so we never eat the greeting)
+    out = re.sub(r"(?im)^\s*subject\s*:.*\n+", "", out).strip()
+    # Subject jammed onto the same line as the greeting ("Subject: … Hi Name,")
+    out = re.sub(
+        r"(?i)^\s*subject\s*:.*?(?=\s*(?:hi|hello|hey|good\s+day)\b)",
+        "",
+        out,
+    ).strip()
+    out = BRACKET_PLACEHOLDER.sub("", out)
+    out = EMAIL_SIGNOFF.sub("", out).strip()
+    out = re.sub(r"[ \t]{2,}", " ", out)
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    return out.strip(" ,;")
+
+
+def has_email_artifacts(text: str) -> bool:
+    """True when the draft still looks like an email template rather than a platform chat message."""
+    if not text:
+        return False
+    if re.search(r"(?i)\bsubject\s*:", text):
+        return True
+    if BRACKET_PLACEHOLDER.search(text):
+        return True
+    # Unresolved mail-merge tokens
+    if re.search(r"(?i)\[(?:your\s+)?name\]|\{(?:your_?)?name\}|<\s*(?:your\s+)?name\s*>", text):
+        return True
+    return False
+
+
 def clean(text: str) -> str:
-    return text.strip().strip('"').strip()
+    return strip_email_artifacts(text.strip().strip('"').strip())
 
 
 ROLE_CHOICE_RULES = """ROLE CHOICE RULES
@@ -355,16 +396,22 @@ def hiring_sentence(role: str, company: str | None = None) -> str:
 
 
 def resolve_client(client: dict | None = None, account_id: str | None = None) -> dict:
-    """Client company this message hires for. Prefer an explicit client dict, else per-account dashboard setting."""
-    if client and (client.get("name") or client.get("description")):
+    """Client employer is always Ocean Park Asset (roles, intros, pay — every step)."""
+    from .hiring_client import ocean_park_client
+    return ocean_park_client()
+
+
+def resolve_agency(account_id: str | None = None, agency: dict | None = None) -> dict:
+    """Recruiting firm profile for a brief mention only."""
+    if agency and (agency.get("name") or agency.get("description")):
         from .hiring_client import parse_description
-        if client.get("name") and client.get("about") is not None:
-            name = (client.get("name") or COMPANY_NAME).strip()
-            about = (client.get("about") or "").strip()
-            return {"name": name, "about": about, "description": client.get("description") or f"{name}\n{about}".strip()}
-        return parse_description(client.get("description") or client.get("name") or "")
-    from .hiring_client import get_hiring_client
-    return get_hiring_client(account_id)
+        if agency.get("name") is not None:
+            name = (agency.get("name") or "").strip()
+            about = (agency.get("about") or "").strip()
+            return {"name": name, "about": about, "description": agency.get("description") or f"{name}\n{about}".strip()}
+        return parse_description(agency.get("description") or "")
+    from .hiring_client import get_recruiting_agency
+    return get_recruiting_agency(account_id)
 
 
 def shingles(text: str, name: str = "") -> set[str]:
@@ -547,9 +594,11 @@ def acceptable_first_message(text: str, role: str, company: str | None = None) -
     company_name = (company or COMPANY_NAME).lower()
     if ARTICLE_MISTAKE.search(text) or re.search(r"\b(\w+) \1\b", lowered):  # a/an mistakes and doubled words
         return False
+    if has_email_artifacts(text):
+        return False
     words = len(text.split())
-    # Match accepted sends (~228–302 chars, ~38–52 words, one soft question).
-    if not (35 <= words <= 55 and 200 <= len(text) <= 320):
+    # Allow a bit more length for the recruitment-company framing sentence.
+    if not (35 <= words <= 65 and 200 <= len(text) <= 420):
         return False
     if text.count("?") > 1:
         return False
@@ -568,6 +617,7 @@ async def write_first_message(
     """Step 1. Full first-touch message written by the model (DeepSeek via OpenRouter). Recruiting-agency voice."""
     hiring = resolve_client(client, account_id)
     company = hiring["name"]
+    agency = resolve_agency(account_id)
     if PROMPTS.get("mode") == "prompt":
         from . import prompted
         return await prompted.first_message(candidate, fixed_role, recent, account_id=account_id, client=hiring)
@@ -590,9 +640,9 @@ async def write_first_message(
     result = {"role": fixed_role or fallback_role(candidate), "message": ""}
     for attempt in range(5):
         prompt = f"""Write ONE complete first outreach message from a recruiting agency to a freelance-platform member.
-The entire message must be your own wording. Do not leave placeholders. Do not return only a fragment.
+This is an in-app chat DM on Himalayas — NOT an email. The entire message must be your own wording.
 
-{client_prompt_block(hiring, first_message=True)}
+{client_prompt_block(hiring, first_message=True, agency=agency)}
 
 Open roles at {company} (pick one unless a role is fixed):
 {role_list_for_prompt()}
@@ -604,17 +654,21 @@ Open roles at {company} (pick one unless a role is fixed):
 TASK
 1. {role_step}
 2. Write the FULL message (greeting through soft question) in plain text.
-Structure (professional agency first touch — about 40 to 52 words, roughly 220–310 characters):
+Structure (about 45 to 60 words, roughly 240–340 characters):
 - Greeting with the member's first name as given for display: {greeting_name(candidate["name"])}
+- One short line: you are with a recruitment company that helps candidates get hired by companies
+  (name the firm once if given in WHO YOU ARE)
 - One concrete line about their background (only if the profile supports it)
-- Light recruiter framing + the role at {company} once
+- The role at {company} once (they would be hired by {company}, not by your firm)
 - One soft question (open to a chat / interested?)
 Rules:
 - Plain everyday words. No markdown, no links, no pay, no process steps.
 - Never write crypto, trading, platform, invest, profit, or token.
-- Do not pitch your recruiting firm. Do not invent client facts.
+- Do not invent client facts. Do not pitch staffing packages or agency marketing.
 - The role name and "{company}" each appear exactly once.
 - At most one question mark.
+- Never write a Subject: line. Never write placeholders such as [Your Name], {{name}}, or <Name>.
+- Do not use an email sign-off (Best, Regards, Sincerely). End on the question.
 - Must not closely copy earlier messages if any are listed below.
 {FIRST_MESSAGE_INSTRUCTIONS}
 
@@ -633,22 +687,26 @@ Return only JSON: {{"role": "<exact role name from the list>", "message": "<the 
 
     # Last attempt: still full message from the model, looser acceptance (length only / spam).
     role = result["role"] or fallback_role(candidate)
-    fallback_prompt = f"""Write a short professional first outreach as a recruiter hiring FOR {company}.
-Greet {greeting_name(candidate["name"])}. Say you are a recruiter on a search for {a_role_phrase(role)} at {company}.
-Ask if they are open to a brief chat. About 40–50 words. No links, no pay, no crypto/trading/platform words.
+    agency_name = (agency.get("name") or "").strip() or "a recruitment company"
+    fallback_prompt = f"""Write a short professional first outreach as a recruitment company helping candidates get hired.
+This is an in-app chat DM, not email. No Subject line, no [Your Name], no Best/Regards sign-off.
+Greet {greeting_name(candidate["name"])}. Say you are with {agency_name} and you help candidates get hired by companies.
+Mention {a_role_phrase(role)} opportunity with {company}. Ask if they are open to a brief chat.
+About 45–55 words. No links, no pay, no crypto/trading/platform words.
 Return only the message text."""
     try:
         text = clean(await complete(fallback_prompt, max_tokens=220, temperature=0.6))
-        if text and not SPAM_TERMS.search(text) and 25 <= len(text.split()) <= 60:
+        if text and not has_email_artifacts(text) and not SPAM_TERMS.search(text) and 25 <= len(text.split()) <= 70:
             return {"role": role, "message": text}
     except Exception:
         pass
     # Absolute last resort if the model is down — still agency-shaped, not "we are the company".
+    firm = (agency.get("name") or "").strip() or "our recruitment team"
     return {
         "role": role,
         "message": (
-            f"Hi {greeting_name(candidate['name'])}, I'm a recruiter working a search for "
-            f"{a_role_phrase(role)} at {company}. Would you be open to a short chat?"
+            f"Hi {greeting_name(candidate['name'])}, I'm with {firm} — we help candidates get hired by companies. "
+            f"There is {a_role_phrase(role)} opening with {company}. Would you be open to a short chat?"
         ),
     }
 
@@ -755,6 +813,7 @@ async def write_intro(
     hiring = resolve_client(client, account_id)
     company = hiring["name"]
     about = hiring.get("about") or ""
+    agency = resolve_agency(account_id)
     facts = role_facts(role)
     from .hiring_client import client_prompt_block
 
@@ -776,7 +835,7 @@ The entire message must be your own wording.
 PRIMARY PURPOSE OF THIS MESSAGE (important): introduce the client company {company}.
 The first outreach only named {company}. This reply is where you properly explain who {company} is and what they do.
 
-{client_prompt_block(hiring)}
+{client_prompt_block(hiring, agency=agency)}
 
 Client brief (must drive the company introduction — do not invent beyond it):
 {about or OCEANPARKASSET_CONTEXT}
@@ -834,10 +893,11 @@ async def write_experience(
     """Step 3. A short, professional experience check based on the member's profile, then one open question."""
     hiring = resolve_client(client, account_id)
     company = hiring["name"]
+    agency = resolve_agency(account_id)
     facts = role_facts(role)
     from .hiring_client import client_prompt_block
     prompt = f"""You are a professional recruiter hiring FOR {company} (recruiting firm, not their employee).
-{client_prompt_block(hiring)}
+{client_prompt_block(hiring, agency=agency)}
 
 {('Role facts: ' + facts) if facts else f'This is a {role} role. Do not invent duties that are not given.'}
 {candidate_block(candidate)}
@@ -920,9 +980,10 @@ async def write_assessment(
     """Step 5a. Assessment overview for the role and the candidate's skills, then the GitHub username question."""
     hiring = resolve_client(client, account_id)
     company = hiring["name"]
+    agency = resolve_agency(account_id)
     from .hiring_client import client_prompt_block
     prompt = f"""You are a professional recruiter hiring FOR {company} (recruiting firm, not their employee).
-{client_prompt_block(hiring)}
+{client_prompt_block(hiring, agency=agency)}
 
 {candidate_block(candidate)}
 Role: {role}
@@ -971,11 +1032,12 @@ async def draft_answer(
     """Unplanned situations: answer the candidate briefly, then repeat the question that is still open."""
     hiring = resolve_client(client, account_id)
     company = hiring["name"]
+    agency = resolve_agency(account_id)
     pending = PENDING_QUESTIONS.get(stage, "")
     history = "\n".join(f"{item['direction']}: {item['body']}" for item in conversation[-8:])
     from .hiring_client import client_prompt_block
     prompt = f"""You are a recruiter (recruiting firm) hiring FOR {company}. You are not an employee of {company}.
-{client_prompt_block(hiring)}
+{client_prompt_block(hiring, agency=agency)}
 
 Client brief: {hiring.get('about') or OCEANPARKASSET_CONTEXT}
 {candidate_block(candidate)}

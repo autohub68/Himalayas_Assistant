@@ -485,26 +485,29 @@ class AccountUpdate(BaseModel):
 
 @app.get("/api/account")
 async def get_account_info(account: Account) -> dict:
-    from .hiring_client import get_hiring_client
+    from .hiring_client import get_recruiting_agency, ocean_park_client
     with connection() as conn:
         row = conn.execute("SELECT id, label FROM accounts WHERE id=?", (account,)).fetchone()
-    client = get_hiring_client(account)
+    agency = get_recruiting_agency(account)
     return {
         **dict(row),
         "himalayas_authorized": oauth_status(account),
         "himalayas_login": login_state(account),
-        "hiring_client": client,
+        "client": ocean_park_client(),
+        "recruiting_agency": agency,
+        # Back-compat for older admin UI builds
+        "hiring_client": agency,
     }
 
 
 @app.put("/api/account")
 async def rename_account(update: AccountUpdate, account: Account) -> dict:
-    from .hiring_client import set_hiring_client
+    from .hiring_client import set_recruiting_agency
     if update.label is not None:
         with connection() as conn:
             conn.execute("UPDATE accounts SET label=? WHERE id=?", (update.label.strip(), account))
     if update.hiring_client_description is not None:
-        set_hiring_client(account, update.hiring_client_description)
+        set_recruiting_agency(account, update.hiring_client_description)
     return await get_account_info(account)
 
 
@@ -1744,10 +1747,11 @@ def account_overview(account_id: str, label: str, paused: bool, last_seen: str |
     latest_status = delivery.get("latest_status")
     latest_error = delivery.get("latest_error")
     latest_at = delivery.get("latest_at")
-    from .hiring_client import get_hiring_client
+    from .hiring_client import get_recruiting_agency, CLIENT_NAME
     return {
         "id": account_id, "label": label, "paused": paused, "last_seen": last_seen, "extension_online": online,
-        "hiring_client_name": get_hiring_client(account_id)["name"],
+        "hiring_client_name": CLIENT_NAME,
+        "recruiting_agency_name": get_recruiting_agency(account_id).get("name") or "",
         "himalayas_authorized": authorized, "himalayas_login": login,
         "automation": automation, "delivery": delivery, "reply_monitor": monitor, "daily": today,
         "imported": imported, "members": len(members), "by_status": by_status,

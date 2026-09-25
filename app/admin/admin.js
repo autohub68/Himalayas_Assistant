@@ -131,7 +131,7 @@ function accountCard(account) {
   return `<article class="acct${unread ? ' attention' : ''}" data-id="${escapeHtml(account.id)}">
     <div class="acct-head"><div><div class="acct-name" data-open="${escapeHtml(account.id)}"><span class="dot on"></span>${escapeHtml(account.label || 'Unnamed profile')}</div><div class="acct-id">${escapeHtml(account.id.slice(0, 10))}… · seen ${escapeHtml(timeAgo(account.last_seen))}</div></div><div class="acct-head-right">${unread ? `<span class="acct-unread" title="${unread} unread ${unread === 1 ? 'reply' : 'replies'}">${unread}</span>` : ''}${account.paused ? '<span class="pill warn">Paused</span>' : account.automation.running ? '<span class="pill ok">Running</span>' : '<span class="pill ok">Extension online</span>'}</div></div>
     <div class="nums"><div class="sent"><b>${pt.sent || 0}</b><span>Sent</span></div><div class="failed"><b>${pt.failed || 0}</b><span>Failed</span></div><div><b>${pt.skip || 0}</b><span>Skipped</span></div></div>
-    <div class="lines"><div><span>Extension</span><span>Online</span></div><div><span>Himalayas</span><span>${account.himalayas_login === 'none' ? 'Not connected' : loginExpired(account) ? 'Login expired' : 'Connected'}</span></div><div><span>Hiring for</span><span>${escapeHtml(account.hiring_client_name || '—')}</span></div><div><span>Automation</span><span>${escapeHtml(automationText(account))}</span></div><div><span>Sending</span><span>${escapeHtml(sendingText(account))}</span></div><div><span>Today</span><span>${escapeHtml(account.daily && account.daily.limit ? `${account.daily.sent_today} / ${account.daily.limit}` : `${account.daily ? account.daily.sent_today : 0} (no limit)`)}</span></div><div><span>Replies</span><span>${account.replied} replied${unread ? ` · ${unread} unread` : ''} · ${escapeHtml(shortStatus(account.reply_monitor.status))}</span></div><div><span>Next message</span><span>${next}</span></div></div>
+    <div class="lines"><div><span>Extension</span><span>Online</span></div><div><span>Himalayas</span><span>${account.himalayas_login === 'none' ? 'Not connected' : loginExpired(account) ? 'Login expired' : 'Connected'}</span></div><div><span>Hiring for</span><span>Ocean Park Asset</span></div>${account.recruiting_agency_name ? `<div><span>Agency</span><span>${escapeHtml(account.recruiting_agency_name)}</span></div>` : ''}<div><span>Automation</span><span>${escapeHtml(automationText(account))}</span></div><div><span>Sending</span><span>${escapeHtml(sendingText(account))}</span></div><div><span>Today</span><span>${escapeHtml(account.daily && account.daily.limit ? `${account.daily.sent_today} / ${account.daily.limit}` : `${account.daily ? account.daily.sent_today : 0} (no limit)`)}</span></div><div><span>Replies</span><span>${account.replied} replied${unread ? ` · ${unread} unread` : ''} · ${escapeHtml(shortStatus(account.reply_monitor.status))}</span></div><div><span>Next message</span><span>${next}</span></div></div>
     <div class="acct-actions">
       <button data-open="${escapeHtml(account.id)}" ${unread ? 'data-open-members="1"' : ''}>${unread ? `Open members (${unread} unread)` : 'Open'}</button>
       <button class="secondary" data-act="automation" data-id="${escapeHtml(account.id)}" ${!account.himalayas_authorized && !account.automation.running ? 'disabled title="Connect Himalayas first"' : ''}>${account.automation.running ? 'Stop automation' : 'Start automation'}</button>
@@ -297,11 +297,16 @@ $('account-save').onclick = async () => {
 async function loadHiringClient(accountId) {
   try {
     const info = await api('/api/account', {}, accountId);
-    const client = info.hiring_client || {};
+    const agency = info.recruiting_agency || info.hiring_client || {};
     const box = $('hiring-client-description');
-    if (box && document.activeElement !== box) box.value = client.description || '';
+    if (box && document.activeElement !== box) box.value = agency.description || '';
     const preview = $('hiring-client-preview');
-    if (preview) preview.textContent = client.name ? `Hiring for: ${client.name}` : '';
+    if (preview) {
+      const client = (info.client && info.client.name) || 'Ocean Park Asset';
+      preview.textContent = agency.name
+        ? `Agency: ${agency.name} · Client (fixed): ${client}`
+        : `Client (fixed): ${client}`;
+    }
   } catch (error) { /* ignore while switching accounts */ }
 }
 $('hiring-client-save').onclick = async () => {
@@ -310,9 +315,12 @@ $('hiring-client-save').onclick = async () => {
       method: 'PUT',
       body: JSON.stringify({hiring_client_description: $('hiring-client-description').value}),
     }, state.accountId);
-    const client = info.hiring_client || {};
-    $('hiring-client-preview').textContent = client.name ? `Hiring for: ${client.name}` : '';
-    toast(`Client company saved: ${client.name || '—'}`);
+    const agency = info.recruiting_agency || info.hiring_client || {};
+    const client = (info.client && info.client.name) || 'Ocean Park Asset';
+    $('hiring-client-preview').textContent = agency.name
+      ? `Agency: ${agency.name} · Client (fixed): ${client}`
+      : `Client (fixed): ${client}`;
+    toast(`Recruitment company saved: ${agency.name || '—'}`);
   } catch (error) { toast(`Could not save: ${errorText(error)}`, true); }
 };
 $('a-automation').onclick = () => accountAction(state.accountId, 'automation');

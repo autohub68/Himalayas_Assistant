@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Control center · Hiring Assistant</title>
-  <link rel="stylesheet" href="admin.css?v=20260926a">
+  <link rel="stylesheet" href="admin.css?v=20260926c">
 </head>
 <body>
   <header class="top">
@@ -85,10 +85,10 @@
       </div>
       <p id="account-meta" class="muted"></p>
       <div class="hiring-client panel-inset">
-        <label for="hiring-client-description"><b>Client company to hire for</b></label>
-        <p class="note">You are a recruiting agency placing talent with a client. First line = client company name. Lines below = brief used when introducing the client. Timing: message 1 only <b>names</b> the client once; the full “about the company” introduction is message 2, right after the member shows interest. All outreach wording is written by the AI model.</p>
-        <textarea id="hiring-client-description" rows="4" maxlength="4000" placeholder="Ocean Park Asset&#10;Builds AI technology for digital asset markets."></textarea>
-        <button id="hiring-client-save" class="secondary">Save client company</button>
+        <label for="hiring-client-description"><b>Recruitment company</b></label>
+        <p class="note">Your recruiting firm (for example Techhavenlabs). First line = firm name. Lines below = short about. First messages say you help candidates get hired by companies, then name the role at <b>Ocean Park Asset</b> (fixed client). Do not write OPA details in this box.</p>
+        <textarea id="hiring-client-description" rows="4" maxlength="4000" placeholder="Techhavenlabs&#10;We help candidates get hired by companies across technology and digital industries."></textarea>
+        <button id="hiring-client-save" class="secondary">Save recruitment company</button>
         <p id="hiring-client-preview" class="muted"></p>
       </div>
       <div class="account-actions">
@@ -236,6 +236,6 @@
     <div id="detail-body" class="detail-body"></div>
   </aside>
 
-  <script src="admin.js?v=20260926a"></script>
+  <script src="admin.js?v=20260926c"></script>
 </body>
 </html>
