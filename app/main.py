@@ -18,13 +18,13 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import chat, playbook, prompted
-from .ai import classify, write_first_message
+from .ai import classify, write_first_message, note_first_accepted, note_first_refused, winning_first_messages, seed_winners_from_database
 from .profile_parse import contact_blocked_reason, KOREA_SKIP_REASON
 from .config import settings
 from .github import settings_ready
 from .db import ACCOUNT_ID_PATTERN, backup_database, connection, ensure_account, get_state, init_db, known_accounts, set_state, utc_now, vacuum
 from .mcp_client import result_text, AlreadyMessaged, ConversationUnavailable, HimalayasMCP, HimalayasUnavailable, letters_only, HimalayasRejected, LoginExpired, MCPError, authorization_url, authorized_accounts, exchange_code, login_state, oauth_status
-from .supabase_client import SupabaseError, SupabaseLedger
+from .supabase_client import SupabaseError, SupabaseLedger, TalentProfiles, SENT as PROFILE_SENT
 
 LOCAL_CLIENTS = {"127.0.0.1", "::1", "localhost", "testclient"}  # "testclient" is the address the test client reports. A real connection never has it
 LOGIN_FAILURES_BEFORE_BLOCK = 8
@@ -134,7 +134,10 @@ dashboard_subscribers: dict[asyncio.Queue, str] = {}
 
 
 def automation_state(account_id: str) -> dict:
-    return automation_states.setdefault(account_id, {"running": False, "page": None, "status": "idle", "queued": 0})
+    return automation_states.setdefault(
+        account_id,
+        {"running": False, "page": None, "after_id": 0, "status": "idle", "queued": 0, "sent": 0, "skipped": 0},
+    )
 
 
 def reply_monitor_state(account_id: str) -> dict:
@@ -430,6 +433,7 @@ async def startup() -> None:
     global reply_monitor_task
     init_db()
     playbook.load_active()
+    seed_winners_from_database()  # first-message style memory from every already-accepted send
     compact_scheduled_queue()
     restore_cooldowns()
     upgrade_pending_intros()
@@ -472,20 +476,32 @@ def is_paused(account_id: str) -> bool:
 
 
 class AccountUpdate(BaseModel):
-    label: str = Field(max_length=60)
+    label: str | None = Field(default=None, max_length=60)
+    hiring_client_description: str | None = Field(default=None, max_length=4000)
 
 
 @app.get("/api/account")
 async def get_account_info(account: Account) -> dict:
+    from .hiring_client import get_hiring_client
     with connection() as conn:
         row = conn.execute("SELECT id, label FROM accounts WHERE id=?", (account,)).fetchone()
-    return {**dict(row), "himalayas_authorized": oauth_status(account), "himalayas_login": login_state(account)}
+    client = get_hiring_client(account)
+    return {
+        **dict(row),
+        "himalayas_authorized": oauth_status(account),
+        "himalayas_login": login_state(account),
+        "hiring_client": client,
+    }
 
 
 @app.put("/api/account")
 async def rename_account(update: AccountUpdate, account: Account) -> dict:
-    with connection() as conn:
-        conn.execute("UPDATE accounts SET label=? WHERE id=?", (update.label.strip(), account))
+    from .hiring_client import set_hiring_client
+    if update.label is not None:
+        with connection() as conn:
+            conn.execute("UPDATE accounts SET label=? WHERE id=?", (update.label.strip(), account))
+    if update.hiring_client_description is not None:
+        set_hiring_client(account, update.hiring_client_description)
     return await get_account_info(account)
 
 
@@ -761,52 +777,297 @@ def automation_key(account_id: str) -> str:
     return f"automation:{account_id}"
 
 
-def remember_automation(account_id: str, page: int | None) -> None:
+def remember_automation(account_id: str, after_id: int | None) -> None:
     """Automation that is running is written to the database, so a restart of the server continues it. None = it is not running."""
-    set_state(automation_key(account_id), json.dumps({"page": page}) if page else "")
+    set_state(automation_key(account_id), json.dumps({"after_id": after_id}) if after_id is not None else "")
 
 
-async def automatic_campaign(account_id: str, page: int = 1) -> None:
-    state = automation_state(account_id)
-    state.update({"running": True, "page": page, "status": "syncing", "queued": 0})
-    remember_automation(account_id, page)
-    skip_korea_queued_messages(account_id)
-    errors_in_a_row = 0
+def candidate_from_profile(row: dict) -> dict:
+    """Build the candidate dict used by message drafting from a talent_profiles row (no local DB)."""
+    stack = row.get("stack") or []
+    if isinstance(stack, str):
+        try:
+            stack = json.loads(stack)
+        except Exception:
+            stack = []
+    if not isinstance(stack, list):
+        stack = []
+    slug = row.get("talent_slug") or ""
+    category = (row.get("category") or "").strip()
+    summary = (row.get("summary") or "").strip()
+    if not summary:
+        # Live talent_profiles may omit summary; draft from category + stack instead.
+        bits = [category] if category else []
+        if stack:
+            bits.append(", ".join(str(s) for s in stack[:12]))
+        summary = ". ".join(bits)
+    return {
+        "external_id": slug,
+        "name": (row.get("candidate_name") or slug or "Candidate").strip() or "Candidate",
+        "profile_url": row.get("profile_url") or (f"https://himalayas.app/@{slug}" if slug else ""),
+        "summary": summary,
+        "category": category or "unknown",
+        "stack": stack,
+        "country": (row.get("country") or "").strip(),
+        "suggested_role": category if category and category.lower() not in {"developer", "non_developer", "unknown"} else "",
+    }
+
+
+async def wait_for_send_window(account_id: str, state: dict) -> bool:
+    """Wait through pause / login hold / first-message cool-down / daily limit. Returns False if automation should stop."""
+    while True:
+        if not automation_state(account_id).get("running") and get_state(automation_key(account_id)) == "":
+            return False
+        if is_paused(account_id):
+            state["status"] = "paused · waiting to resume"
+            await asyncio.sleep(5)
+            continue
+        if hold_active(account_id):
+            state["status"] = hold_hint(holds[account_id]["reason"])
+            state["detail"] = holds[account_id]["reason"]
+            await asyncio.sleep(5)
+            continue
+        if hold_active("first:" + account_id):
+            state["status"] = hold_hint(holds["first:" + account_id]["reason"])
+            state["detail"] = holds["first:" + account_id]["reason"]
+            await asyncio.sleep(5)
+            continue
+        until = next_first_message_at.get(account_id, 0)
+        now = time.monotonic()
+        if until > now:
+            wait = int(until - now)
+            state["status"] = f"spacing · next send in {wait}s"
+            await asyncio.sleep(min(5, max(1, wait)))
+            continue
+        today = await profiles_daily_status(account_id)
+        if today["reached"]:
+            state["status"] = daily_limit_reason(today)
+            await asyncio.sleep(60)
+            continue
+        return True
+
+
+async def profiles_sent_today(account_id: str) -> int:
+    """First messages marked sent today on talent_profiles for this account (UTC day)."""
+    if not settings.supabase_url or not settings.supabase_key:
+        return first_messages_today(account_id)
     try:
+        profiles = TalentProfiles()
+        day = day_start().isoformat()
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.get(
+                profiles.endpoint,
+                headers={**profiles.headers, "Prefer": "count=exact"},
+                params={
+                    "select": "id",
+                    "status": f"eq.{PROFILE_SENT}",
+                    "account_id": f"eq.{account_id}",
+                    "sent_at": f"gte.{day}",
+                    "limit": "1",
+                },
+            )
+        if response.is_error:
+            return first_messages_today(account_id)
+        content_range = response.headers.get("content-range") or ""
+        if "/" in content_range:
+            try:
+                return int(content_range.rsplit("/", 1)[-1])
+            except ValueError:
+                pass
+        return len(response.json() or [])
+    except Exception:
+        return first_messages_today(account_id)
+
+
+async def profiles_daily_status(account_id: str) -> dict:
+    limit = settings.daily_dm_limit
+    sent = await profiles_sent_today(account_id)
+    reset = day_start() + timedelta(days=1)
+    return {
+        "limit": limit,
+        "sent_today": sent,
+        "remaining": max(0, limit - sent) if limit else None,
+        "reached": bool(limit) and sent >= limit,
+        "resets_at": reset.isoformat(),
+        "resets_in_seconds": int((reset - datetime.now(timezone.utc)).total_seconds()),
+    }
+
+
+async def process_talent_profile(account_id: str, row: dict, state: dict) -> str:
+    """Claim one talent_profiles row, send or skip, write status. Returns outcome label."""
+    slug = row.get("talent_slug") or ""
+    if not slug:
+        return "skipped"
+    label = account_label(account_id)
+    profiles = TalentProfiles()
+    status = (row.get("status") or "").strip()
+    if status == PROFILE_SENT:
+        return "skipped_sent"
+    if status == "skip":
+        return "skipped"
+    if status == "queued" and row.get("account_id") and row.get("account_id") != account_id:
+        return "skipped_claimed"
+
+    claimed = await profiles.claim(slug, account_id, label)
+    if not claimed:
+        return "skipped_claimed"
+
+    candidate = candidate_from_profile(row)
+    blocked = contact_blocked_reason({"country": candidate["country"], "summary": candidate["summary"]})
+    if blocked:
+        await profiles.mark_skip(slug, account_id=account_id, account_label=label, error=blocked)
+        state["skipped"] = state.get("skipped", 0) + 1
+        return "skipped_blocked"
+
+    if not await wait_for_send_window(account_id, state):
+        await profiles.release_claim(slug, account_id)
+        return "stopped"
+
+    state["status"] = f"drafting · {candidate['name']}"
+    state["current_name"] = candidate["name"]
+    delivery_state(account_id).update({"status": "sending", "current_name": candidate["name"], "current_id": None, "detail": ""})
+    recent = recent_first_messages(account_id)
+    try:
+        first = await write_first_message(candidate, recent=list(recent), account_id=account_id)
+    except Exception as exc:
+        await profiles.mark_failed(slug, account_id=account_id, account_label=label, error=f"Draft failed: {exc}")
+        delivery_state(account_id).update({"status": "failed", "current_name": None, "current_id": None})
+        return "failed_draft"
+
+    body = first["message"]
+    state["status"] = f"sending · {candidate['name']}"
+    try:
+        await HimalayasMCP(account_id).send_message(slug, body, first_contact=True)
+    except LoginExpired as exc:
+        set_hold(account_id, str(exc))
+        await profiles.release_claim(slug, account_id)
+        delivery_state(account_id).update({"status": hold_hint(str(exc)), "detail": str(exc), "current_name": None})
+        return "held_login"
+    except AlreadyMessaged:
+        await profiles.mark_skip(
+            slug, account_id=account_id, account_label=label,
+            error="Already messaged on Himalayas (contacted before, for example by hand)",
+        )
+        state["skipped"] = state.get("skipped", 0) + 1
+        delivery_state(account_id).update({"status": "skipped", "current_name": None, "current_id": None})
+        return "skipped_already"
+    except ConversationUnavailable as exc:
+        await profiles.mark_skip(slug, account_id=account_id, account_label=label, error=str(exc))
+        state["skipped"] = state.get("skipped", 0) + 1
+        delivery_state(account_id).update({"status": "failed", "current_name": None, "current_id": None})
+        note_ops(account_id, "warn", "cannot reopen", str(exc))
+        return "skipped_unreachable"
+    except HimalayasUnavailable as exc:
+        # Temporary — keep claim released so the same or another bot can retry later.
+        await profiles.release_claim(slug, account_id)
+        pause = 60
+        reason = f"Himalayas unavailable ({str(exc)[:90]}). Retrying shortly."
+        holds["first:" + account_id] = {"reason": reason, "since": utc_now(), "until": time.monotonic() + pause}
+        delivery_state(account_id).update({"status": hold_hint(reason), "detail": reason, "current_name": None})
+        note_ops(account_id, "warn", hold_hint(reason), reason)
+        return "held_outage"
+    except HimalayasRejected as exc:
+        if is_rate_limit_error(exc):
+            # Keep queued claim? Plan: keep queued or retry. Release so we don't strand the row if this bot dies.
+            await profiles.release_claim(slug, account_id)
+            reason = f"Rate limit reached (10 messages/minute). Please wait. Retrying shortly. {str(exc)[:120]}"
+            until = time.monotonic() + RATE_LIMIT_HOLD_SECONDS
+            next_first_message_at[account_id] = until
+            holds["first:" + account_id] = {"reason": reason, "since": utc_now(), "until": until}
+            delivery_state(account_id).update({"status": hold_hint(reason), "detail": reason, "current_name": None})
+            note_ops(account_id, "warn", hold_hint(reason), reason)
+            return "held_rate"
+        await profiles.mark_failed(slug, account_id=account_id, account_label=label, error=str(exc))
+        note_ops(account_id, "warn", "send refused", str(exc))
+        if any(word in str(exc).lower() for word in ("filter", "spam")):
+            note_first_refused(body)
+        delivery_state(account_id).update({"status": "send refused", "detail": str(exc), "current_name": None})
+        return "failed_reject"
+    except Exception as exc:
+        await profiles.mark_failed(slug, account_id=account_id, account_label=label, error=str(exc)[:300])
+        delivery_state(account_id).update({"status": "failed", "current_name": None, "current_id": None})
+        return "failed"
+
+    sent_at = utc_now()
+    await profiles.mark_sent(
+        slug, account_id=account_id, account_label=label, message_body=body, sent_at=sent_at,
+    )
+    note_first_message_sent(account_id)
+    note_first_accepted(body)
+    note_ops(account_id, "info", "sent · talent_profiles", f"Accepted first message to {candidate['name']}")
+    state["queued"] = state.get("queued", 0)  # keep key for UI
+    state["sent"] = state.get("sent", 0) + 1
+    delivery_state(account_id).update({"status": "sent", "current_name": None, "current_id": None, "detail": ""})
+    publish_dashboard_update("message_sent", account_id)
+    return "sent"
+
+
+async def automatic_campaign(account_id: str, after_id: int = 0) -> None:
+    """Drive first-message outreach from Supabase talent_profiles (no Himalayas page import / local queue)."""
+    state = automation_state(account_id)
+    state.update({
+        "running": True, "page": None, "after_id": after_id, "status": "starting · talent_profiles",
+        "queued": 0, "sent": 0, "skipped": 0,
+    })
+    remember_automation(account_id, after_id)
+    errors_in_a_row = 0
+    cursor = after_id
+    try:
+        if not settings.supabase_url or not settings.supabase_key:
+            state["status"] = "failed: SUPABASE_URL / SUPABASE_KEY not configured"
+            remember_automation(account_id, None)
+            return
+        profiles = TalentProfiles()
+        empty_batches = 0
         while True:
             try:
-                state["page"] = page
-                state["status"] = "syncing"
-                remember_automation(account_id, page)
-                sync_result = await import_candidates(account_id, page)
-                if not sync_result["imported"]:
-                    state["status"] = "complete"
-                    remember_automation(account_id, None)  # every page is done
+                if get_state(automation_key(account_id)) == "":
+                    state["status"] = "stopped"
                     break
-                if not sync_result.get("fresh", sync_result["imported"]):
-                    # Everyone on this page was contacted before. There is nothing to write or to wait for: go straight to the next page.
-                    state["status"] = f"skipping page {page}: all {sync_result['already_contacted']} members already contacted"
-                    page += 1
-                    await asyncio.sleep(0.2)
+                state["after_id"] = cursor
+                state["status"] = "fetching · talent_profiles"
+                remember_automation(account_id, cursor)
+                batch = await profiles.list_pending(limit=settings.automation_batch_size, after_id=cursor)
+                if not batch:
+                    empty_batches += 1
+                    if empty_batches >= 2:
+                        state["status"] = (
+                            f"complete · talent_profiles ({state.get('sent', 0)} sent, "
+                            f"{state.get('skipped', 0)} skipped)"
+                        )
+                        remember_automation(account_id, None)
+                        break
+                    # Re-scan from the start for newly pending / released rows.
+                    cursor = 0
+                    state["status"] = "rescanning · talent_profiles"
+                    await asyncio.sleep(2)
                     continue
-                state["status"] = "queueing"
-                campaign_result = await queue_campaign(account_id, CampaignRequest(page=page))
-                state["queued"] += campaign_result["queued"]
-                state["status"] = "sending"
-                while await page_has_pending_messages(account_id, page):
-                    await asyncio.sleep(5)
-                page += 1
-                errors_in_a_row = 0
-                state.pop("last_error", None)
+                empty_batches = 0
+                for row in batch:
+                    if get_state(automation_key(account_id)) == "":
+                        state["status"] = "stopped"
+                        return
+                    row_id = int(row.get("id") or 0)
+                    if row_id > cursor:
+                        cursor = row_id
+                    state["after_id"] = cursor
+                    remember_automation(account_id, cursor)
+                    outcome = await process_talent_profile(account_id, row, state)
+                    if outcome == "stopped":
+                        state["status"] = "stopped"
+                        return
+                    errors_in_a_row = 0
+                    state.pop("last_error", None)
+                    # Small yield so Stop / dashboard stay responsive between members.
+                    await asyncio.sleep(0.2)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                # Any error (Himalayas down, network, a bad response) only pauses the automation. It tries the same page again.
                 pause = AUTOMATION_RETRY_SECONDS[min(errors_in_a_row, len(AUTOMATION_RETRY_SECONDS) - 1)]
                 errors_in_a_row += 1
                 state["last_error"] = {"message": str(exc)[:200], "at": utc_now()}
                 state["status"] = f"retrying in {pause}s: {str(exc)[:120]}"
-                print(f"Automation for {account_id} hit an error on page {page}, retrying in {pause}s: {exc!r}")
+                print(f"Automation for {account_id} (talent_profiles) error, retrying in {pause}s: {exc!r}")
                 publish_dashboard_update("automation_error", account_id)
                 await asyncio.sleep(pause)
     except asyncio.CancelledError:
@@ -814,7 +1075,6 @@ async def automatic_campaign(account_id: str, page: int = 1) -> None:
         raise
     finally:
         state["running"] = False
-        state["page"] = page
 
 
 def resume_automation() -> None:
@@ -823,14 +1083,20 @@ def resume_automation() -> None:
         rows = conn.execute("SELECT key, value FROM app_state WHERE key LIKE 'automation:%' AND value != ''").fetchall()
     for row in rows:
         account_id = row["key"].split(":", 1)[1]
+        after_id = 0
         try:
-            page = max(1, int(json.loads(row["value"]).get("page") or 1))
+            data = json.loads(row["value"])
+            if isinstance(data, dict):
+                after_id = max(0, int(data.get("after_id") or data.get("page") or 0))
+                # Legacy page-based resume: start from the beginning of talent_profiles.
+                if "page" in data and "after_id" not in data:
+                    after_id = 0
         except (ValueError, TypeError, AttributeError):
-            page = 1
+            after_id = 0
         task = automation_tasks.get(account_id)
         if not task or task.done():
-            automation_tasks[account_id] = asyncio.create_task(automatic_campaign(account_id, page))
-            print(f"Automation for {account_id} continues from page {page}.")
+            automation_tasks[account_id] = asyncio.create_task(automatic_campaign(account_id, after_id))
+            print(f"Automation for {account_id} continues from talent_profiles after_id={after_id}.")
 
 
 @app.post("/api/automation/start")
@@ -838,9 +1104,9 @@ async def start_automation(account: Account) -> dict:
     task = automation_tasks.get(account)
     if task and not task.done():
         return automation_state(account)
-    automation_tasks[account] = asyncio.create_task(automatic_campaign(account))
+    automation_tasks[account] = asyncio.create_task(automatic_campaign(account, 0))
     publish_dashboard_update("automation_started", account)
-    return {**automation_state(account), "status": "starting"}
+    return {**automation_state(account), "status": "starting · talent_profiles"}
 
 
 @app.post("/api/automation/stop")
@@ -930,7 +1196,7 @@ async def queue_campaign(account_id: str, request: CampaignRequest) -> dict:
 
     async def generate(candidate: dict) -> tuple[dict, dict]:
         async with semaphore:
-            first = await write_first_message(candidate, recent=list(recent))
+            first = await write_first_message(candidate, recent=list(recent), account_id=account_id)
             recent.insert(0, first["message"])  # the messages written after this one must differ from it too
             return candidate, first
 
@@ -1279,8 +1545,10 @@ def account_overview(account_id: str, label: str, paused: bool, last_seen: str |
     online = extension_online(last_seen)
     if not online:
         alerts.insert(0, "Chrome extension offline or removed")
+    from .hiring_client import get_hiring_client
     return {
         "id": account_id, "label": label, "paused": paused, "last_seen": last_seen, "extension_online": online,
+        "hiring_client_name": get_hiring_client(account_id)["name"],
         "himalayas_authorized": authorized, "himalayas_login": login,
         "automation": automation, "delivery": delivery_state(account_id), "reply_monitor": monitor, "daily": today,
         "imported": imported, "members": len(members), "by_status": by_status,
@@ -1838,7 +2106,7 @@ async def retry_failed(request: RetryFailedRequest, account: Account) -> dict:
                 candidate = conn.execute("SELECT * FROM candidates WHERE id=?", (row["candidate_id"],)).fetchone()
             item = parse_candidate(candidate)
             async with gate:
-                fresh = await write_first_message(item, fixed_role=candidate["suggested_role"] or None, recent=list(recent))
+                fresh = await write_first_message(item, fixed_role=candidate["suggested_role"] or None, recent=list(recent), account_id=account)
                 recent.insert(0, fresh["message"])
             bodies[row["id"]] = fresh["message"]
 
@@ -2118,18 +2386,30 @@ def first_message_gap() -> float:
 
 
 def recent_first_messages(account_id: str, limit: int = 15) -> list[str]:
-    """The newest first messages (sent or waiting). New messages are compared with these so that they do not all look alike."""
+    """Newest first messages used as anti-clone context. Accepted winners come first so new drafts match what works."""
+    winners = winning_first_messages(min(8, limit))
     with connection() as conn:
         rows = conn.execute(
             "SELECT body FROM messages WHERE account_id=? AND direction='outbound' AND stage='first_sent' AND status IN ('sent', 'scheduled', 'approved') ORDER BY id DESC LIMIT ?",
             (account_id, limit),
         ).fetchall()
-    return [row["body"] for row in rows]
+    local = [row["body"] for row in rows if row["body"]]
+    merged: list[str] = []
+    seen: set[str] = set()
+    for text in [*winners, *local]:
+        if text and text not in seen:
+            seen.add(text)
+            merged.append(text)
+        if len(merged) >= limit:
+            break
+    return merged
 
 
 HOLD_SECONDS = 60
-# Himalayas caps send_message at 10/minute. Wait just over a minute, then retry the same body.
-RATE_LIMIT_HOLD_SECONDS = 70
+# Himalayas caps send_message at 10/minute. Wait just over a minute, then retry.
+# Must also cool the whole account: delaying only one message lets the rest of the overdue
+# queue fire immediately and hit the same cap again, so nothing appears to send.
+RATE_LIMIT_HOLD_SECONDS = 75
 # After this many refusals for one member, switch to the neutral/safer template before giving up at MAX_REFUSALS_PER_MEMBER.
 SAFER_AFTER_REFUSALS = 2
 holds: dict[str, dict] = {}  # "ledger" for the shared contact ledger, or an account id for its Himalayas login
@@ -2223,7 +2503,9 @@ async def requeue_intro(row, account_id: str) -> int | None:
         level = max(intro_level(), used if refusals_for_member(row["candidate_id"]) <= 1 else min(used + 1, chat.ai.INTRO_LEVELS))
         if already_sent_this_step(row["candidate_id"], "intro_sent"):
             return None
-        text = await chat.ai.write_intro(parse_candidate(candidate), candidate["suggested_role"] or chat.ai.default_role(True), level)
+        text = await chat.ai.write_intro(
+            parse_candidate(candidate), candidate["suggested_role"] or chat.ai.default_role(True), level, account_id=account_id,
+        )
         with connection() as conn:
             return conn.execute(
                 "INSERT INTO messages (account_id, candidate_id, direction, body, status, send_after, stage, variant, created_at) VALUES (?, ?, 'outbound', ?, 'scheduled', ?, 'intro_sent', ?, ?)",
@@ -2264,11 +2546,20 @@ async def requeue_rewritten(row, account_id: str, safer: bool = False) -> int | 
             return None
         item = parse_candidate(candidate)
         if safer:
-            # Prefer the fixed neutral template after several refusals — less likely to trip the spam filter.
-            role = candidate["suggested_role"] or chat.ai.default_role(True)
-            fresh = {"role": role, "message": chat.ai.neutral_first_message(item, role)}
+            # Still use the writer so accepted-style length/tone apply; pass refused bodies so wording changes.
+            fresh = await write_first_message(
+                item,
+                fixed_role=candidate["suggested_role"] or chat.ai.default_role(True),
+                recent=[row["body"], *recent_first_messages(account_id), *chat.ai.refused_first_messages(6)],
+                account_id=account_id,
+            )
         else:
-            fresh = await write_first_message(item, fixed_role=candidate["suggested_role"] or None, recent=[row["body"], *recent_first_messages(account_id)])
+            fresh = await write_first_message(
+                item,
+                fixed_role=candidate["suggested_role"] or None,
+                recent=[row["body"], *recent_first_messages(account_id)],
+                account_id=account_id,
+            )
         with connection() as conn:
             new_id = conn.execute(
                 "INSERT INTO messages (account_id, candidate_id, direction, body, status, send_after, stage, created_at) VALUES (?, ?, 'outbound', ?, 'scheduled', ?, 'first_sent', ?)",
@@ -2354,23 +2645,26 @@ async def deliver(message_id: int) -> str:
             return "skipped"
     if hold_active(account_id):  # this account's Himalayas login needs attention. Do not even try.
         return hold_message(message_id, account_id, holds[account_id]["reason"])
+    # Know whether this is a first contact before marking "sending", so a rate-limit / first-message
+    # hold does not flash "Sending to …" for a message that will only wait.
+    first_contact = row["id"] == (await first_outbound_message_id(row["candidate_id"]))
+    if first_contact:
+        if hold_active("first:" + account_id):
+            return hold_message(message_id, account_id, holds["first:" + account_id]["reason"])
+        if hold_active("ledger"):
+            return hold_message(message_id, account_id, holds["ledger"]["reason"])
+        today = daily_status(account_id)
+        if today["reached"]:
+            return hold_message(message_id, account_id, daily_limit_reason(today), min(3600, max(60, today["resets_in_seconds"])))
     state["current_id"] = message_id
     state["status"] = "sending"
+    state["detail"] = ""
     publish_dashboard_update("message_sending", account_id)
     state["current_name"] = row["candidate_name"]
-    first_contact = False
     delivered = False  # becomes True once Himalayas has accepted the message
     try:
-        first_contact = row["id"] == (await first_outbound_message_id(row["candidate_id"]))
         ledger = None
         if first_contact:
-            if hold_active("first:" + account_id):  # only FIRST messages wait. Replies to members who answered never do.
-                return hold_message(message_id, account_id, holds["first:" + account_id]["reason"])
-            if hold_active("ledger"):
-                return hold_message(message_id, account_id, holds["ledger"]["reason"])
-            today = daily_status(account_id)
-            if today["reached"]:  # also stops the immediate resend after a refusal from going past the limit
-                return hold_message(message_id, account_id, daily_limit_reason(today), min(3600, max(60, today["resets_in_seconds"])))
             try:
                 ledger = SupabaseLedger()
                 already_contacted = await ledger.was_contacted(row["candidate_external_id"], account_id=account_id)
@@ -2386,7 +2680,7 @@ async def deliver(message_id: int) -> str:
                         "UPDATE messages SET status='skipped', error=? WHERE id=?",
                         ("Already contacted or claimed by another profile (shared contact ledger)", message_id),
                     )
-                state["status"] = "skipped"
+                state.update({"status": "skipped", "current_id": None, "current_name": None})
                 publish_dashboard_update("message_skipped", account_id)
                 return "skipped"
         try:
@@ -2438,10 +2732,16 @@ async def deliver(message_id: int) -> str:
             publish_dashboard_update("paused", account_id)
             return hold_message(message_id, account_id, reason, pause)
         except HimalayasRejected as exc:
-            # Rate limits are temporary pacing (10/min), not spam. Keep the message queued, wait, retry the same body.
-            # Do not count toward refusal streaks or trigger rewrites — otherwise bots stall on "Failed" and long holds.
+            # Rate limits are temporary pacing (10/min), not spam. Keep the message queued and cool THIS
+            # account's first-message queue so overdue siblings do not stampede the same cap.
             if is_rate_limit_error(exc):
-                reason = f"Rate limit reached (10 messages/minute). Please wait. Retrying the same message shortly. {str(exc)[:120]}"
+                reason = (
+                    f"Rate limit reached (10 messages/minute). Please wait. "
+                    f"Retrying shortly. {str(exc)[:120]}"
+                )
+                until = time.monotonic() + RATE_LIMIT_HOLD_SECONDS
+                next_first_message_at[account_id] = until
+                holds["first:" + account_id] = {"reason": reason, "since": utc_now(), "until": until}
                 return hold_message(message_id, account_id, reason, RATE_LIMIT_HOLD_SECONDS)
 
             # Himalayas refused it, so it was not delivered. Mark it failed with the real reason. The bot keeps working:
@@ -2452,6 +2752,8 @@ async def deliver(message_id: int) -> str:
             hint = "refused · spam filter" if spam_refusal else "send refused"
             state.update({"status": hint, "detail": str(exc), "current_id": None, "current_name": None})
             note_ops(account_id, "warn", hint, str(exc))
+            if spam_refusal and first_contact:
+                note_first_refused(row["body"])
             if first_contact:
                 await note_ledger(account_id, ledger_candidate(row), "failed", message_id, row["body"], str(exc))
             refused = refusals_for_member(row["candidate_id"])
@@ -2522,6 +2824,8 @@ async def deliver(message_id: int) -> str:
         if first_contact:
             rejection_streak.pop(account_id, None)  # a first message was accepted, so refusals in a row start again from zero
             note_first_message_sent(account_id)
+            note_first_accepted(row["body"])  # learn this wording for every future first message
+            note_ops(account_id, "info", "sent · learned style", f"Accepted first message to {row['candidate_name']} added to style memory.")
         else:
             next_reply_at[account_id] = time.monotonic() + random.uniform(*REPLY_GAP_SECONDS)
             if row["stage"] == "intro_sent":

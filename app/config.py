@@ -30,6 +30,8 @@ class Settings(BaseSettings):
     supabase_url: str = ""
     supabase_key: str = ""
     supabase_table: str = "outreach_contacts"
+    supabase_profiles_table: str = "talent_profiles"
+    automation_batch_size: int = 25
     github_token: str = ""
     github_api_url: str = "https://api.github.com"
     github_owner: str = ""

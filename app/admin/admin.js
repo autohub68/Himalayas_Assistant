@@ -91,7 +91,11 @@ function renderTotals(t) {
 const shortStatus = (text) => { const line = String(text || '').split('\n')[0]; return line.length > 60 ? `${line.slice(0, 57)}…` : line; };
 function automationText(account) {
   const a = account.automation;
-  if (a.running) return `Running · page ${a.page ?? '?'} · ${a.status}`;
+  if (a.running) {
+    const sent = a.sent != null ? ` · ${a.sent} sent` : '';
+    const skipped = a.skipped != null ? ` · ${a.skipped} skipped` : '';
+    return `Running · talent_profiles${sent}${skipped} · ${a.status}`;
+  }
   return a.status && a.status !== 'idle' ? shortStatus(a.status) : 'Idle';
 }
 function sendingText(account) {
@@ -118,7 +122,7 @@ function accountCard(account) {
   return `<article class="acct${unread ? ' attention' : ''}" data-id="${escapeHtml(account.id)}">
     <div class="acct-head"><div><div class="acct-name" data-open="${escapeHtml(account.id)}"><span class="dot on"></span>${escapeHtml(account.label || 'Unnamed profile')}</div><div class="acct-id">${escapeHtml(account.id.slice(0, 10))}… · seen ${escapeHtml(timeAgo(account.last_seen))}</div></div><div class="acct-head-right">${unread ? `<span class="acct-unread" title="${unread} unread ${unread === 1 ? 'reply' : 'replies'}">${unread}</span>` : ''}${account.paused ? '<span class="pill warn">Paused</span>' : account.automation.running ? '<span class="pill ok">Running</span>' : '<span class="pill ok">Extension online</span>'}</div></div>
     <div class="nums"><div><b>${account.members}</b><span>Members</span></div><div class="sent"><b>${b.sent || 0}</b><span>Sent</span></div><div class="failed"><b>${b.failed || 0}</b><span>Failed</span></div><div class="queued"><b>${queued}</b><span>Queued</span></div></div>
-    <div class="lines"><div><span>Extension</span><span>Online</span></div><div><span>Himalayas</span><span>${account.himalayas_login === 'none' ? 'Not connected' : loginExpired(account) ? 'Login expired' : 'Connected'}</span></div><div><span>Automation</span><span>${escapeHtml(automationText(account))}</span></div><div><span>Sending</span><span>${escapeHtml(sendingText(account))}</span></div><div><span>Today</span><span>${escapeHtml(account.daily && account.daily.limit ? `${account.daily.sent_today} / ${account.daily.limit}` : `${account.daily ? account.daily.sent_today : 0} (no limit)`)}</span></div><div><span>Replies</span><span>${account.replied} replied${unread ? ` · ${unread} unread` : ''} · ${escapeHtml(shortStatus(account.reply_monitor.status))}</span></div><div><span>Next message</span><span>${next}</span></div></div>
+    <div class="lines"><div><span>Extension</span><span>Online</span></div><div><span>Himalayas</span><span>${account.himalayas_login === 'none' ? 'Not connected' : loginExpired(account) ? 'Login expired' : 'Connected'}</span></div><div><span>Hiring for</span><span>${escapeHtml(account.hiring_client_name || '—')}</span></div><div><span>Automation</span><span>${escapeHtml(automationText(account))}</span></div><div><span>Sending</span><span>${escapeHtml(sendingText(account))}</span></div><div><span>Today</span><span>${escapeHtml(account.daily && account.daily.limit ? `${account.daily.sent_today} / ${account.daily.limit}` : `${account.daily ? account.daily.sent_today : 0} (no limit)`)}</span></div><div><span>Replies</span><span>${account.replied} replied${unread ? ` · ${unread} unread` : ''} · ${escapeHtml(shortStatus(account.reply_monitor.status))}</span></div><div><span>Next message</span><span>${next}</span></div></div>
     <div class="acct-actions">
       <button data-open="${escapeHtml(account.id)}" ${unread ? 'data-open-members="1"' : ''}>${unread ? `Open members (${unread} unread)` : 'Open'}</button>
       <button class="secondary" data-act="automation" data-id="${escapeHtml(account.id)}" ${!account.himalayas_authorized && !account.automation.running ? 'disabled title="Connect Himalayas first"' : ''}>${account.automation.running ? 'Stop automation' : 'Start automation'}</button>
@@ -228,6 +232,7 @@ function renderAccountHead() {
   const account = currentAccount();
   if (!account) return;
   if (document.activeElement !== $('account-label')) $('account-label').value = account.label || '';
+  if (document.activeElement !== $('hiring-client-description')) loadHiringClient(account.id);
   $('account-meta').textContent = `Account ${account.id} · extension ${account.extension_online ? 'online' : 'offline'} · last seen ${timeAgo(account.last_seen)} · ${account.himalayas_login === 'connected' ? 'Himalayas connected' : account.himalayas_login === 'expired' ? 'Himalayas login expired' : 'Himalayas not connected'}`;
   $('a-automation').textContent = account.automation.running ? 'Stop automation' : 'Start automation';
   $('a-automation').className = account.automation.running ? 'warn' : '';
@@ -249,6 +254,27 @@ function updateUnreadBadge(unread) {
 $('account-save').onclick = async () => {
   try { await api('/api/account', {method: 'PUT', body: JSON.stringify({label: $('account-label').value.trim()})}, state.accountId); toast('Name saved.'); } catch (error) { toast(`Could not save: ${errorText(error)}`, true); }
   await loadOverview();
+};
+async function loadHiringClient(accountId) {
+  try {
+    const info = await api('/api/account', {}, accountId);
+    const client = info.hiring_client || {};
+    const box = $('hiring-client-description');
+    if (box && document.activeElement !== box) box.value = client.description || '';
+    const preview = $('hiring-client-preview');
+    if (preview) preview.textContent = client.name ? `Hiring for: ${client.name}` : '';
+  } catch (error) { /* ignore while switching accounts */ }
+}
+$('hiring-client-save').onclick = async () => {
+  try {
+    const info = await api('/api/account', {
+      method: 'PUT',
+      body: JSON.stringify({hiring_client_description: $('hiring-client-description').value}),
+    }, state.accountId);
+    const client = info.hiring_client || {};
+    $('hiring-client-preview').textContent = client.name ? `Hiring for: ${client.name}` : '';
+    toast(`Client company saved: ${client.name || '—'}`);
+  } catch (error) { toast(`Could not save: ${errorText(error)}`, true); }
 };
 $('a-automation').onclick = () => accountAction(state.accountId, 'automation');
 $('a-pause').onclick = () => accountAction(state.accountId, 'pause');

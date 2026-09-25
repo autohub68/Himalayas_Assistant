@@ -96,6 +96,10 @@ label{display:block;margin:10px 0 4px;color:var(--muted);font:10px 'DM Mono',mon
 .alert.bad{background:#3a1f1d;color:var(--red)}
 .acct-actions{display:flex;flex-wrap:wrap;gap:7px}
 .acct-actions button,.acct-actions .button-link{padding:6px 11px;font-size:12px}
+.hiring-client{margin:12px 0;padding:12px 14px;background:var(--panel-2);border-radius:8px}
+.hiring-client label{display:block;margin-bottom:4px}
+.hiring-client textarea{width:100%;min-height:88px;margin:8px 0;font:inherit;padding:8px 10px;border-radius:6px;border:1px solid var(--line);background:var(--panel);color:inherit;resize:vertical}
+.hiring-client button{margin-top:4px}
 
 /* account detail */
 .account-head{display:grid;gap:12px}

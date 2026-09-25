@@ -84,29 +84,51 @@ def sanitize(message: str, prompts: dict) -> str:
 
 
 def sample_recent(recent: list[str] | None) -> str:
-    if not recent:
-        return ""
-    shown = "\n".join(f"---\n{text[:400]}" for text in recent[:3])
-    return f"\nEARLIER MESSAGES (the new message must be clearly different in opening, sentence order, and closing. If the first one was refused by the platform, change the style a lot: shorter, plainer, more neutral)\n{shown}\n"
+    guide = ai.style_guide_for_prompt(3)
+    parts = [guide] if guide.strip() else []
+    if recent:
+        shown = "\n".join(f"---\n{text[:400]}" for text in recent[:3])
+        parts.append(
+            "EARLIER DRAFTS (the new message must be clearly different in opening, sentence order, and closing. "
+            "If one was refused by the platform, change the style: shorter, plainer, more neutral)\n"
+            f"{shown}\n"
+        )
+    return ("\n" + "\n".join(parts)) if parts else ""
 
 
-async def first_message(candidate: dict, fixed_role: str | None = None, recent: list[str] | None = None, prompts: dict | None = None) -> dict:
+async def first_message(
+    candidate: dict,
+    fixed_role: str | None = None,
+    recent: list[str] | None = None,
+    prompts: dict | None = None,
+    *,
+    account_id: str | None = None,
+    client: dict | None = None,
+) -> dict:
     """Message 1, written from the prompts. Returns {"role", "message"}. It always returns a message: a refused or rule-breaking text is written again."""
     p = prompts or prompts_now()
+    hiring = ai.resolve_client(client, account_id)
+    from .hiring_client import client_prompt_block
     role_step = f'The role is "{fixed_role}".' if fixed_role else 'Choose the ONE role from the KNOWLEDGE text that suits the member best. Name it in "role" exactly as it is written there. If the knowledge text has no roles, use a short job title.'
     feedback = ""
     best: dict | None = None
-    for attempt in range(4):
-        prompt = f"""You write the first message from a recruiter to one member of a freelance platform.
+    avoid = list(recent or []) + ai.refused_first_messages(6) + ai.winning_first_messages(4)
+    for attempt in range(5):
+        prompt = f"""Write ONE complete first outreach message from a recruiting agency to a freelance-platform member.
+You are sourcing for a client — not pitching your agency. The entire message must be your own wording.
 
-KNOWLEDGE (the only facts you may state)
+{client_prompt_block(hiring, first_message=True)}
+
+KNOWLEDGE (roles and facts you may use — do not invent beyond this)
 {p.get('knowledge') or '(none given)'}
 
-FIRST MESSAGE PROMPT (from the operator. Follow it)
+OPERATOR FIRST-MESSAGE GUIDANCE (follow the intent; keep agency realism above)
 {p['first']}
 
 STYLE
 {style_text(p)}
+- About 40 to 50 words. Human recruiter tone. Soft question at the end.
+- Name the client company and the role once each. Light "I'm a recruiter…" at most.
 
 {SYSTEM_RULES}
 - The member's name is used in this first message. Write it as: {ai.greeting_name(candidate['name'])}
@@ -115,9 +137,9 @@ STYLE
 {ai.candidate_block(candidate)}
 {sample_recent(recent)}{feedback}
 {role_step}
-Return only JSON: {{"role": "<role name>", "message": "<the message>"}}"""
+Return only JSON: {{"role": "<role name>", "message": "<the full message>"}}"""
         try:
-            data = ai.parse_json(await ai.complete(prompt, max_tokens=600, temperature=0.9))
+            data = ai.parse_json(await ai.complete(prompt, max_tokens=600, temperature=0.85))
         except ValueError:
             continue
         message = ai.clean(str(data.get("message", "")))
@@ -125,8 +147,13 @@ Return only JSON: {{"role": "<role name>", "message": "<the message>"}}"""
         if not message:
             continue
         problems = problems_in(message, p, first=True)
-        if recent and ai.too_similar(message, ai.greeting_name(candidate["name"]), recent):
-            problems.append("It is too much like an earlier message. Change the wording clearly.")
+        words = len(message.split())
+        if not (35 <= words <= 55 and 200 <= len(message) <= 320):
+            problems.append("Keep the whole message around 40–50 words (about 220–300 characters), like the accepted examples.")
+        if message.count("?") > 1:
+            problems.append("Use at most one question at the end.")
+        if avoid and ai.too_similar(message, ai.greeting_name(candidate["name"]), avoid, limit=0.28):
+            problems.append("It is too much like an earlier or refused message. Change the wording clearly.")
         if best is None or len(problems) < best["problems"]:
             best = {"role": role, "message": message, "problems": len(problems)}
         if not problems:
@@ -139,7 +166,14 @@ Return only JSON: {{"role": "<role name>", "message": "<the message>"}}"""
     if best:
         return {"role": best["role"], "message": best["message"]}
     greeting = f"Hi {ai.greeting_name(candidate['name'])},"
-    return {"role": fixed_role or "Open role", "message": f"{greeting} I came across your profile. We have an opening that may suit you. Would you be open to a short chat?"}
+    company = hiring.get("name") or "our client"
+    return {
+        "role": fixed_role or "Open role",
+        "message": (
+            f"{greeting} I'm a recruiter working a search that may fit your background. "
+            f"There is an opening with {company}. Would you be open to a short chat?"
+        ),
+    }
 
 
 def conversation_text(history: list[dict]) -> str:
@@ -154,7 +188,8 @@ async def decide(candidate: dict, body: str, history: list[dict], sent_count: in
     feedback = ""
     result = {"action": "reply", "message": "", "github_username": None}
     for attempt in range(3):
-        prompt = f"""You are the recruiter for this company. You answer one member of a freelance platform in a chat.
+        prompt = f"""You are a human recruiter at an independent recruiting firm, continuing a chat with a candidate about a client role.
+Focus on the client company and the role. Do not pitch your agency.
 
 KNOWLEDGE (the only facts you may state)
 {p.get('knowledge') or '(none given)'}

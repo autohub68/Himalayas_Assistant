@@ -1,8 +1,8 @@
 """Hiring conversation. Steps 1 to 3 are shared. An experience check sits between the introduction and the process. Step 5 depends on the role.
 
 Stages (the stage is the state a conversation is left in by our last SENT message):
-  first_sent      step 1 sent: short offer for one suggested role
-  intro_sent      step 2 sent: company introduction, asked about interest and confidence
+  first_sent      step 1 sent: short offer; client company named once only (no full about)
+  intro_sent      step 2 sent: full client-company introduction (what they do), then interest/confidence question
   experience_sent step 3 sent: profile-based experience question, asked for a short work background
   process_sent    step 4 sent: hiring process overview, asked if it works
   assessment_sent step 5, developer roles: assessment overview, asked for the GitHub username
@@ -101,16 +101,17 @@ async def plan_reply(candidate: dict, body: str, history: list[dict]) -> dict | 
         return {"body": await ai.write_answer(candidate, stage, history, body, role), "stage": stage}
 
     if intent == "positive":
+        account_id = candidate.get("account_id")
         if stage == FIRST:
             level = int(get_state("intro_level", "1"))  # learned: the wording of the introduction that Himalayas accepts
-            return {"body": await ai.write_intro(candidate, role, level), "stage": INTRO, "variant": level}
+            return {"body": await ai.write_intro(candidate, role, level, account_id=account_id), "stage": INTRO, "variant": level}
         if stage == INTRO:
-            return {"body": await ai.write_experience(candidate, role), "stage": EXPERIENCE}
+            return {"body": await ai.write_experience(candidate, role, account_id=account_id), "stage": EXPERIENCE}
         if stage == EXPERIENCE:
             return {"body": ai.process_message(name, role), "stage": PROCESS}
         # Process agreed. Developers take an assessment. Business roles apply on their careers page.
         if ai.is_developer_role(role):
-            return {"body": await ai.write_assessment(candidate, role), "stage": ASSESSMENT}
+            return {"body": await ai.write_assessment(candidate, role, account_id=account_id), "stage": ASSESSMENT}
         return {"body": ai.application_message(name, role), "stage": APPLY}
 
     return {"body": await ai.write_answer(candidate, stage, history, body, role), "stage": stage}

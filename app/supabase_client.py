@@ -338,3 +338,287 @@ class SupabaseLedger:
                 if owner and payload.get("account_id") and owner != payload["account_id"]:
                     return False
         return True
+
+
+# Outreach status on talent_profiles (empty = pending).
+SKIP = "skip"
+PROFILES_BASE_SELECT = (
+    "id,talent_slug,candidate_name,profile_url,category,stack,country,status,created_at,updated_at"
+)
+PROFILES_OPTIONAL = (
+    "summary", "error", "account_id", "account_label", "message_body", "sent_at",
+)
+
+
+class TalentProfiles:
+    """Prepared Himalayas profiles in Supabase. Status coordinates multi-bot first-message outreach.
+
+    Empty/null/failed = eligible. queued = claimed by one bot. sent = messaged. skip = do not message.
+    """
+
+    _columns: set[str] | None = None
+
+    def __init__(self) -> None:
+        if not settings.supabase_url or not settings.supabase_key:
+            raise SupabaseError("SUPABASE_URL and SUPABASE_KEY are not configured")
+        table = settings.supabase_profiles_table or "talent_profiles"
+        self.endpoint = f"{settings.supabase_url.rstrip('/')}/rest/v1/{table}"
+        self.headers = {
+            "apikey": settings.supabase_key,
+            "Authorization": f"Bearer {settings.supabase_key}",
+            "Content-Type": "application/json",
+        }
+
+    async def columns(self) -> set[str]:
+        cls = TalentProfiles
+        if cls._columns is not None:
+            return cls._columns
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                response = await client.get(
+                    self.endpoint, headers=self.headers, params={"select": "*", "limit": "1"},
+                )
+        except httpx.HTTPError as exc:
+            raise SupabaseError(f"Could not reach Supabase talent_profiles: {type(exc).__name__}") from exc
+        if response.is_error:
+            raise SupabaseError(f"talent_profiles schema probe failed ({response.status_code}): {response.text}")
+        rows = response.json() or []
+        cls._columns = set(rows[0].keys()) if rows else set(PROFILES_BASE_SELECT.split(","))
+        return cls._columns
+
+    async def _select(self) -> str:
+        available = await self.columns()
+        parts = [c for c in PROFILES_BASE_SELECT.split(",") if c in available]
+        for col in PROFILES_OPTIONAL:
+            if col in available:
+                parts.append(col)
+        return ",".join(parts)
+
+    def _filter_payload(self, payload: dict, available: set[str]) -> dict:
+        return {k: v for k, v in payload.items() if k in available}
+
+    async def list_pending(self, *, limit: int = 25, after_id: int = 0) -> list[dict]:
+        """Next pending profiles (status empty or failed), ordered by id. after_id is an exclusive cursor."""
+        limit = max(1, min(limit, 100))
+        params: dict[str, str] = {
+            "select": await self._select(),
+            "or": "(status.eq.,status.eq.failed,status.is.null)",
+            "order": "id.asc",
+            "limit": str(limit),
+        }
+        if after_id > 0:
+            params["id"] = f"gt.{after_id}"
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.get(self.endpoint, headers=self.headers, params=params)
+        except httpx.HTTPError as exc:
+            raise SupabaseError(f"Could not reach Supabase talent_profiles: {type(exc).__name__}") from exc
+        if response.is_error:
+            raise SupabaseError(f"talent_profiles list failed ({response.status_code}): {response.text}")
+        rows = response.json()
+        return rows if isinstance(rows, list) else []
+
+    async def get(self, talent_slug: str) -> dict | None:
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                response = await client.get(
+                    self.endpoint,
+                    headers=self.headers,
+                    params={"talent_slug": f"eq.{talent_slug}", "select": await self._select(), "limit": "1"},
+                )
+        except httpx.HTTPError as exc:
+            raise SupabaseError(f"Could not reach Supabase talent_profiles: {type(exc).__name__}") from exc
+        if response.is_error:
+            raise SupabaseError(f"talent_profiles lookup failed ({response.status_code}): {response.text}")
+        rows = response.json()
+        return rows[0] if rows else None
+
+    async def claim(self, talent_slug: str, account_id: str, account_label: str = "") -> bool:
+        """Atomically claim a pending row as queued for this account. Returns False if another bot owns it or it is sent/skip."""
+        now = _utc_now()
+        available = await self.columns()
+        payload = self._filter_payload(
+            {
+                "status": QUEUED,
+                "error": None,
+                "account_id": account_id,
+                "account_label": account_label or "",
+                "updated_at": now,
+            },
+            available,
+        )
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                response = await client.patch(
+                    self.endpoint,
+                    headers={**self.headers, "Prefer": "return=representation,count=exact"},
+                    params={
+                        "talent_slug": f"eq.{talent_slug}",
+                        "or": "(status.eq.,status.eq.failed,status.is.null)",
+                    },
+                    json=payload,
+                )
+        except httpx.HTTPError as exc:
+            raise SupabaseError(f"talent_profiles claim failed: {type(exc).__name__}") from exc
+        if response.is_error:
+            raise SupabaseError(f"talent_profiles claim failed ({response.status_code}): {response.text}")
+        rows = response.json() if response.content else []
+        if isinstance(rows, list) and rows:
+            row = rows[0]
+            if row.get("status") != QUEUED:
+                return False
+            if "account_id" in available:
+                return row.get("account_id") == account_id
+            # No account_id column: a non-empty representation means this PATCH updated the row.
+            return True
+        # Zero rows updated — already queued/sent/skip by someone else.
+        return False
+
+    async def mark_sent(
+        self,
+        talent_slug: str,
+        *,
+        account_id: str,
+        account_label: str = "",
+        message_body: str = "",
+        sent_at: str | None = None,
+    ) -> None:
+        now = sent_at or _utc_now()
+        available = await self.columns()
+        await self._patch_owned(
+            talent_slug,
+            account_id,
+            self._filter_payload(
+                {
+                    "status": SENT,
+                    "error": None,
+                    "account_id": account_id,
+                    "account_label": account_label or "",
+                    "message_body": message_body or "",
+                    "sent_at": now,
+                    "updated_at": now,
+                },
+                available,
+            ),
+            available,
+        )
+
+    async def mark_skip(
+        self,
+        talent_slug: str,
+        *,
+        account_id: str,
+        account_label: str = "",
+        error: str | None = None,
+    ) -> None:
+        """Mark skip. Never overwrites an existing sent row."""
+        row = await self.get(talent_slug)
+        if row and row.get("status") == SENT:
+            return
+        now = _utc_now()
+        available = await self.columns()
+        await self._patch_owned(
+            talent_slug,
+            account_id,
+            self._filter_payload(
+                {
+                    "status": SKIP,
+                    "error": error,
+                    "account_id": account_id,
+                    "account_label": account_label or "",
+                    "updated_at": now,
+                },
+                available,
+            ),
+            available,
+        )
+
+    async def mark_failed(
+        self,
+        talent_slug: str,
+        *,
+        account_id: str,
+        account_label: str = "",
+        error: str | None = None,
+    ) -> None:
+        row = await self.get(talent_slug)
+        if row and row.get("status") == SENT:
+            return
+        now = _utc_now()
+        available = await self.columns()
+        await self._patch_owned(
+            talent_slug,
+            account_id,
+            self._filter_payload(
+                {
+                    "status": FAILED,
+                    "error": error,
+                    "account_id": account_id,
+                    "account_label": account_label or "",
+                    "updated_at": now,
+                },
+                available,
+            ),
+            available,
+        )
+
+    async def release_claim(self, talent_slug: str, account_id: str) -> None:
+        """Return our queued claim to pending so another bot (or us later) can retry (rate limit / outage)."""
+        now = _utc_now()
+        available = await self.columns()
+        params: dict[str, str] = {
+            "talent_slug": f"eq.{talent_slug}",
+            "status": f"eq.{QUEUED}",
+        }
+        if "account_id" in available:
+            params["account_id"] = f"eq.{account_id}"
+        payload = self._filter_payload({"status": "", "error": None, "updated_at": now}, available)
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                response = await client.patch(
+                    self.endpoint,
+                    headers={**self.headers, "Prefer": "return=minimal"},
+                    params=params,
+                    json=payload,
+                )
+        except httpx.HTTPError as exc:
+            raise SupabaseError(f"talent_profiles release failed: {type(exc).__name__}") from exc
+        if response.is_error:
+            raise SupabaseError(f"talent_profiles release failed ({response.status_code}): {response.text}")
+
+    async def _patch_owned(self, talent_slug: str, account_id: str, payload: dict, available: set[str]) -> None:
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                own_params: dict[str, str] = {
+                    "talent_slug": f"eq.{talent_slug}",
+                    "status": f"eq.{QUEUED}",
+                }
+                if "account_id" in available:
+                    own_params["account_id"] = f"eq.{account_id}"
+                own = await client.patch(
+                    self.endpoint,
+                    headers={**self.headers, "Prefer": "return=minimal"},
+                    params=own_params,
+                    json=payload,
+                )
+                if own.is_error:
+                    raise SupabaseError(f"talent_profiles update failed ({own.status_code}): {own.text}")
+                broader = await client.patch(
+                    self.endpoint,
+                    headers={**self.headers, "Prefer": "return=minimal"},
+                    params={
+                        "talent_slug": f"eq.{talent_slug}",
+                        "or": "(status.eq.,status.eq.failed,status.is.null)",
+                    },
+                    json=payload,
+                )
+                if broader.is_error:
+                    raise SupabaseError(f"talent_profiles update failed ({broader.status_code}): {broader.text}")
+        except httpx.HTTPError as exc:
+            raise SupabaseError(f"talent_profiles update failed: {type(exc).__name__}") from exc
+
+
+def _utc_now() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat()

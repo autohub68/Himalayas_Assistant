@@ -4,6 +4,9 @@
 The browser launches this script for each message. It reads one JSON request
 ({"action": "status" | "start" | "stop"}), replies with one JSON object, and exits.
 Standard library only, so it runs before the backend virtual environment exists.
+
+Start/stop must work whether the server was launched by this helper, by hand, or
+left behind as a duplicate process — every extension profile shares one server.
 """
 import json
 import os
@@ -22,6 +25,7 @@ LOG_FILE = STATE_DIR / "backend.log"
 SERVICE_NAME = "him-hiring-assistant.service"
 UNIT_FILE = Path.home() / ".config" / "systemd" / "user" / SERVICE_NAME
 HEALTH_URL = "http://127.0.0.1:8765/api/health"
+PORT = 8765
 START_TIMEOUT_SECONDS = 20
 
 
@@ -78,10 +82,71 @@ def server_host() -> str:
     return "127.0.0.1"
 
 
+def backend_pids() -> set[int]:
+    """Every process that looks like our uvicorn (or still holds the listen port)."""
+    found: set[int] = set()
+    if PID_FILE.exists():
+        try:
+            found.add(int(PID_FILE.read_text().strip()))
+        except ValueError:
+            pass
+    try:
+        listed = subprocess.check_output(["pgrep", "-f", "uvicorn app.main:app"], text=True)
+        for line in listed.splitlines():
+            line = line.strip()
+            if line.isdigit():
+                found.add(int(line))
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+    try:
+        # ss: users:(("python",pid=123,fd=...))
+        out = subprocess.check_output(["ss", "-ltnp"], text=True, stderr=subprocess.DEVNULL)
+        for line in out.splitlines():
+            if f":{PORT}" not in line:
+                continue
+            for part in line.replace(",", " ").split():
+                if part.startswith("pid="):
+                    pid = part.split("=", 1)[1]
+                    if pid.isdigit():
+                        found.add(int(pid))
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+    return {pid for pid in found if pid > 1}
+
+
+def kill_pid(pid: int) -> None:
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True)
+        else:
+            os.kill(pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+
+def kill_all_backends() -> None:
+    """Stop every copy of the backend so Start/Stop is reliable across Chrome profiles."""
+    if uses_systemd():
+        try:
+            systemctl("stop")
+        except Exception:
+            pass
+    pids = backend_pids()
+    for pid in pids:
+        kill_pid(pid)
+    time.sleep(0.4)
+    for pid in backend_pids():
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    PID_FILE.unlink(missing_ok=True)
+
+
 def spawn_backend() -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    command = [venv_python(), "-m", "uvicorn", "app.main:app", "--host", server_host(), "--port", "8765"]
-    options = {"cwd": PROJECT_DIR, "stdin": subprocess.DEVNULL, "stderr": subprocess.STDOUT}
+    command = [venv_python(), "-m", "uvicorn", "app.main:app", "--host", server_host(), "--port", str(PORT)]
+    options = {"cwd": str(PROJECT_DIR), "stdin": subprocess.DEVNULL, "stderr": subprocess.STDOUT}
     if os.name == "nt":
         options["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
     else:
@@ -91,25 +156,16 @@ def spawn_backend() -> None:
     PID_FILE.write_text(str(process.pid))
 
 
-def kill_spawned_backend() -> None:
-    if not PID_FILE.exists():
-        return
-    try:
-        pid = int(PID_FILE.read_text())
-        if os.name == "nt":
-            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True)
-        else:
-            os.kill(pid, signal.SIGTERM)
-    except (ValueError, ProcessLookupError):
-        pass
-    PID_FILE.unlink(missing_ok=True)
-
-
 def start() -> dict:
     if is_running():
         return {"ok": True, "running": True, "message": "Server already running"}
+    # Port may be held by a dead/hung uvicorn that no longer answers /api/health.
+    kill_all_backends()
     try:
-        systemctl("start") if uses_systemd() else spawn_backend()
+        if uses_systemd():
+            systemctl("start")
+        else:
+            spawn_backend()
     except Exception as error:
         return {"ok": False, "running": False, "message": f"Could not start server: {error}"}
     deadline = time.monotonic() + START_TIMEOUT_SECONDS
@@ -122,14 +178,15 @@ def start() -> dict:
 
 def stop() -> dict:
     try:
-        systemctl("stop") if uses_systemd() else kill_spawned_backend()
+        kill_all_backends()
     except Exception as error:
         return {"ok": False, "running": is_running(), "message": f"Could not stop server: {error}"}
     for _ in range(20):
-        if not is_running():
+        if not is_running() and not backend_pids():
             return {"ok": True, "running": False, "message": "Server stopped"}
         time.sleep(0.5)
-    return {"ok": False, "running": True, "message": "Server is still running (not started by this helper?)"}
+        kill_all_backends()
+    return {"ok": False, "running": is_running(), "message": "Server is still running"}
 
 
 def main() -> None:

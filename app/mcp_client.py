@@ -340,25 +340,52 @@ class HimalayasMCP:
             rooms = await self.rooms_by_slug()
             if candidate_slug in rooms:
                 return rooms[candidate_slug]["room"]
+            for slug, info in rooms.items():
+                if slug == candidate_slug or info["room"].endswith("_" + candidate_slug):
+                    return info["room"]
         except Exception as exc:
             print(f"Could not list Himalayas conversations while recovering a room: {exc}")
-        company = get_state(f"himalayas_company:{self.account_id}")
-        if not company:
-            return None
-        guessed = f"{ROOM_PREFIX}{company}_{candidate_slug}"
-        try:
-            result = await self.call("get_conversation", {"room_name": guessed})
-            text = result_text(result)
-            if re.search(r"Room: `" + re.escape(guessed) + r"`", text) or "messages" in text.lower() or "🏢" in text or "👤" in text:
+        for company in self._company_guesses():
+            guessed = f"{ROOM_PREFIX}{company}_{candidate_slug}"
+            if await self._room_is_real(guessed):
                 return guessed
-            # Some replies omit the room line but still return the thread for a valid room.
-            if text.strip() and "not found" not in text.lower() and "does not exist" not in text.lower():
-                return guessed
-        except HimalayasRejected:
-            return None
-        except Exception as exc:
-            print(f"Could not open guessed Himalayas room {guessed}: {exc}")
         return None
+
+    async def _room_is_real(self, room: str) -> bool:
+        """True only when get_conversation clearly returns that room — not an error / empty reply."""
+        try:
+            result = await self.call("get_conversation", {"room_name": room})
+            text = result_text(result)
+        except Exception:
+            return False
+        lower = text.lower()
+        if not text.strip():
+            return False
+        if any(bad in lower for bad in ("not found", "does not exist", "conversation not found", "unable to fetch", "error")):
+            return False
+        if re.search(r"Room: `" + re.escape(room) + r"`", text):
+            return True
+        # Accept a real thread body for this room name (company/member bubbles).
+        return ("🏢" in text or "👤" in text) and "message" in lower
+
+    def _company_guesses(self) -> list[str]:
+        """Companies to try when guessing a room name. Own login first, then others known on this server."""
+        guesses: list[str] = []
+        own = get_state(f"himalayas_company:{self.account_id}")
+        if own:
+            guesses.append(own)
+        try:
+            with connection() as conn:
+                for row in conn.execute(
+                    "SELECT value FROM app_state WHERE key LIKE 'himalayas_company:%' AND value != '' ORDER BY key"
+                ):
+                    if row["value"] not in guesses:
+                        guesses.append(row["value"])
+        except Exception:
+            pass
+        if "ocean-park-asset" not in guesses:
+            guesses.append("ocean-park-asset")
+        return guesses
 
     async def open_room(self, candidate_slug: str) -> str:
         """Create the conversation, or return the existing one. It does not reliably post a message, so none is passed."""
@@ -367,8 +394,6 @@ class HimalayasMCP:
         except HimalayasRejected as exc:
             detail = str(exc)
             if "already exists but could not be fetched" in detail:
-                # The room is often still usable (same company, another profile, or a fetch glitch). Recover it
-                # instead of treating every case as a permanently deleted conversation.
                 room = await self.find_existing_room(candidate_slug)
                 if room:
                     try:
@@ -385,7 +410,6 @@ class HimalayasMCP:
             raise
         match = re.search(r"Room: `([^`]+)`", result_text(result))
         if not match:
-            # start_conversation sometimes succeeds without a room line when the conversation already exists.
             room = await self.find_existing_room(candidate_slug)
             if room:
                 return room
@@ -398,27 +422,110 @@ class HimalayasMCP:
 
     async def send_message(self, candidate_slug: str, body: str, first_contact: bool = False) -> dict:
         """Post the message, then read the conversation back. It counts as sent only if the text is really there."""
-        room = await self.open_room(candidate_slug)
+        try:
+            room = await self.open_room(candidate_slug)
+        except ConversationUnavailable:
+            # Ghost thread: Himalayas says it exists but will not return a room. start_conversation+message
+            # hits the same wall — fail this member only (do not hold the whole account).
+            raise
+        return await self._send_to_room(room, candidate_slug, body, first_contact=first_contact)
+
+    async def _send_to_room(
+        self, room: str, candidate_slug: str, body: str, first_contact: bool = False, *, allow_start_fallback: bool = True
+    ) -> dict:
         if first_contact:
-            # The contact ledger only knows what this app sent. Himalayas knows everything, including messages sent by hand.
-            # Never send a first message into a conversation where the company has already written.
             before = await self.call("get_conversation", {"room_name": room})
             if has_company_message(result_text(before)):
                 raise AlreadyMessaged("Already messaged on Himalayas")
-        result = await self.call(settings.mcp_send_message_tool, {"room_name": room, "message": body})
+        try:
+            result = await self.call(settings.mcp_send_message_tool, {"room_name": room, "message": body})
+        except HimalayasRejected as exc:
+            # Wrong/stale room name, or conversation never opened for this login.
+            if allow_start_fallback and (
+                "conversation not found" in str(exc).lower() or "use `start_conversation`" in str(exc).lower()
+            ):
+                return await self._send_via_start_conversation(candidate_slug, body, first_contact=first_contact)
+            raise
         conversation = await self.call("get_conversation", {"room_name": room})
         if letters_only(body)[:40] not in letters_only(result_text(conversation)):
             raise HimalayasRejected("Himalayas accepted the request, but the message is not in the conversation")
         return result
 
+    async def _send_via_start_conversation(self, candidate_slug: str, body: str, first_contact: bool = False) -> dict:
+        """Open a new thread and pass the message when send_message has no usable room yet."""
+        try:
+            result = await self.call("start_conversation", {"talent_slug": candidate_slug, "message": body})
+        except HimalayasRejected as exc:
+            detail = str(exc).lower()
+            if "already exists" in detail:
+                room = await self.find_existing_room(candidate_slug)
+                if room:
+                    return await self._send_to_room(
+                        room, candidate_slug, body, first_contact=first_contact, allow_start_fallback=False
+                    )
+                # Ghost: exists in Himalayas' index but 404 on fetch and absent from list_conversations.
+                if "could not be fetched" in detail:
+                    raise ConversationUnavailable(
+                        "Himalayas cannot reopen this member's conversation. It already exists but could not be fetched, "
+                        "and it was not found in the conversation list. Nothing was sent."
+                    ) from exc
+                # list_conversations may be down — keep queued and retry later.
+                raise HimalayasUnavailable(
+                    "Conversation exists on Himalayas but cannot be opened right now. Will retry."
+                ) from exc
+            if "failed to start conversation" in detail:
+                raise HimalayasUnavailable(str(exc)) from exc
+            raise
+        match = re.search(r"Room: `([^`]+)`", result_text(result))
+        room = match.group(1) if match else await self.find_existing_room(candidate_slug)
+        if room:
+            try:
+                note_company(self.account_id, room, candidate_slug)
+            except Exception as exc:
+                print(f"Could not note the Himalayas company: {exc}")
+            try:
+                conversation = await self.call("get_conversation", {"room_name": room})
+                if letters_only(body)[:40] in letters_only(result_text(conversation)):
+                    return result
+                # start_conversation sometimes opens the room without posting the message — send explicitly.
+                return await self._send_to_room(
+                    room, candidate_slug, body, first_contact=False, allow_start_fallback=False
+                )
+            except Exception as exc:
+                print(f"Started conversation but could not verify the message: {exc}")
+                return result
+        # No room line and no recoverable room — start_conversation accepted the call; treat as delivered only if text says so.
+        text = result_text(result).lower()
+        if "message" in text or "sent" in text or letters_only(body)[:20] in letters_only(result_text(result)):
+            return result
+        raise HimalayasRejected("Himalayas did not confirm the message after start_conversation")
+
     async def rooms_by_slug(self) -> dict[str, dict]:
         """Every conversation Himalayas holds, keyed by the member's slug, with its state line."""
         result = await self.call("list_conversations", {})
         rooms = {}
-        for match in re.finditer(r"👤 \*\*(.+?)\*\*(.*?)🔑 Room: `([^`]+)`", result_text(result), re.S):
+        text = result_text(result)
+        for match in re.finditer(r"👤 \*\*(.+?)\*\*(.*?)🔑 Room: `([^`]+)`", text, re.S):
             room = match.group(3)
             slug = room.split("_", 4)[-1] if room.count("_") >= 4 else room.rsplit("_", 1)[-1]
+            for company in self._company_guesses():
+                prefix = f"{ROOM_PREFIX}{company}_"
+                if room.startswith(prefix):
+                    slug = room[len(prefix):]
+                    break
             rooms[slug] = {"name": match.group(1), "room": room, "state": " ".join(match.group(2).split())}
+        if not rooms:
+            for match in re.finditer(r"Room: `([^`]+)`", text):
+                room = match.group(1)
+                if not room.startswith(ROOM_PREFIX):
+                    continue
+                slug = room.rsplit("_", 1)[-1]
+                for company in self._company_guesses():
+                    prefix = f"{ROOM_PREFIX}{company}_"
+                    if room.startswith(prefix):
+                        slug = room[len(prefix):]
+                        break
+                rooms[slug] = {"name": slug, "room": room, "state": ""}
         return rooms
 
     async def get_thread(self, room: str) -> dict:

@@ -331,28 +331,40 @@ FIRST_MESSAGE_INSTRUCTIONS = ""  # extra instructions for the one personal sente
 closer_cycle = itertools.cycle(random.sample(CLOSERS, len(CLOSERS)))
 
 
-# The sentence that names the role changes from message to message. One fixed sentence in every message ("X is hiring for the Y role")
-# is the strongest sign of a template, and near-identical messages sent to many people are what spam filters catch.
+# Recruiting-firm voice: we hire FOR {company} (the client), not as their employee.
 HIRING_PHRASES = (
-    "{company} has an opening for {a_role}.",
-    "We are looking for {a_role} at {company}.",
+    "I am recruiting for {a_role} at {company}.",
     "I am reaching out about the {role} position at {company}.",
-    "{company} is growing its team and needs {a_role}.",
     "There is {a_role} role open at {company}.",
-    "I work with {company}, and we are hiring {a_role}.",
-    "We are hiring {a_role} at {company}.",
-    "{company} is looking to add {a_role} to the team.",
+    "I recruit for {company}, and they need {a_role}.",
+    "{company} has an opening for {a_role}.",
+    "I am hiring {a_role} for {company}.",
+    "We are a recruiting firm filling {a_role} for {company}.",
+    "There is an opening for {a_role} with {company}.",
     "I am recruiting {a_role} for {company}.",
-    "Our team at {company} is searching for {a_role}.",
+    "{company} is looking to add {a_role}, and I am hiring for them.",
 )
 GREETINGS = ("Hi {name},", "Hello {name},", "Hi there {name},", "Good day {name},")
 hiring_cycle = itertools.cycle(random.sample(HIRING_PHRASES, len(HIRING_PHRASES)))
 greeting_cycle = itertools.cycle(random.sample(GREETINGS, len(GREETINGS)))
 
 
-def hiring_sentence(role: str) -> str:
+def hiring_sentence(role: str, company: str | None = None) -> str:
     a_role = ("an " if role[:1].upper() in "AEIOU" else "a ") + role
-    return next(hiring_cycle).format(company=COMPANY_NAME, role=role, a_role=a_role)
+    return next(hiring_cycle).format(company=company or COMPANY_NAME, role=role, a_role=a_role)
+
+
+def resolve_client(client: dict | None = None, account_id: str | None = None) -> dict:
+    """Client company this message hires for. Prefer an explicit client dict, else per-account dashboard setting."""
+    if client and (client.get("name") or client.get("description")):
+        from .hiring_client import parse_description
+        if client.get("name") and client.get("about") is not None:
+            name = (client.get("name") or COMPANY_NAME).strip()
+            about = (client.get("about") or "").strip()
+            return {"name": name, "about": about, "description": client.get("description") or f"{name}\n{about}".strip()}
+        return parse_description(client.get("description") or client.get("name") or "")
+    from .hiring_client import get_hiring_client
+    return get_hiring_client(account_id)
 
 
 def shingles(text: str, name: str = "") -> set[str]:
@@ -374,7 +386,9 @@ def too_similar(text: str, name: str, recent: list[str] | None, limit: float = 0
 def greeting_name(name: str) -> str:
     """The name as it should appear in a greeting. Names typed in all lower case or all capitals are fixed, and a username-like
     placeholder ("XplicitTv User", digits, no letters) becomes "there". Odd-looking names were refused more often than proper ones."""
-    cleaned = " ".join(name.split())
+    cleaned = " ".join(part.strip("_*") for part in name.split())
+    cleaned = re.sub(r"[_\*]{2,}", " ", cleaned)
+    cleaned = " ".join(cleaned.split())
     letters = re.sub(r"[^A-Za-z\u00C0-\u024F]", "", cleaned)
     if len(letters) < 2 or re.search(r"\d|\buser\b|\bprofile\b|\btest\b", cleaned, re.IGNORECASE):
         return "there"
@@ -389,6 +403,7 @@ STARTERS = (
 )
 starter_cycle = itertools.cycle(random.sample(STARTERS, len(STARTERS)))
 
+# Layouts that match messages Himalayas actually accepted (greeting + optional "saw profile" + detail/hiring + soft closer).
 LAYOUTS = (
     "{greeting} {detail} {hiring} {closer}",
     "{greeting} {hiring} {detail} {closer}",
@@ -396,88 +411,250 @@ LAYOUTS = (
     "{greeting} I saw your profile. {hiring} {detail} {closer}",
 )
 
+# Accepted first messages live here (and in app_state). New messages are written to match this voice.
+WINNERS_STATE_KEY = "first_message_winners"
+REFUSED_STATE_KEY = "first_message_refused"
+WINNERS_KEEP = 40
+REFUSED_KEEP = 30
 
-def assemble_first_message(candidate: dict, role: str, detail: str) -> str:
+
+def _load_message_list(key: str) -> list[str]:
+    from .db import get_state
+    raw = get_state(key, "[]") or "[]"
+    try:
+        items = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    return [str(item).strip() for item in items if str(item).strip()]
+
+
+def _save_message_list(key: str, items: list[str], keep: int) -> None:
+    from .db import set_state
+    # Newest last; keep the tail.
+    uniq: list[str] = []
+    seen: set[str] = set()
+    for text in items:
+        text = text.strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        uniq.append(text)
+    set_state(key, json.dumps(uniq[-keep:]))
+
+
+def winning_first_messages(limit: int = 12) -> list[str]:
+    """Newest accepted first messages first. Seeded from the database when memory is empty."""
+    items = _load_message_list(WINNERS_STATE_KEY)
+    if not items:
+        items = seed_winners_from_database()
+    return list(reversed(items[-limit:]))
+
+
+def refused_first_messages(limit: int = 8) -> list[str]:
+    return list(reversed(_load_message_list(REFUSED_STATE_KEY)[-limit:]))
+
+
+def seed_winners_from_database() -> list[str]:
+    """Load every first message Himalayas already accepted into style memory."""
+    from .db import connection
+    with connection() as conn:
+        rows = conn.execute(
+            "SELECT body FROM messages WHERE direction='outbound' AND status='sent' AND COALESCE(stage, 'first_sent')='first_sent' "
+            "AND body IS NOT NULL AND trim(body) != '' ORDER BY id"
+        ).fetchall()
+    bodies = [row["body"].strip() for row in rows if row["body"] and row["body"].strip()]
+    if bodies:
+        _save_message_list(WINNERS_STATE_KEY, bodies, WINNERS_KEEP)
+    return bodies
+
+
+def note_first_accepted(body: str) -> None:
+    """Call when a first message is delivered. Style memory updates in real time."""
+    text = (body or "").strip()
+    if not text:
+        return
+    items = _load_message_list(WINNERS_STATE_KEY)
+    items.append(text)
+    _save_message_list(WINNERS_STATE_KEY, items, WINNERS_KEEP)
+
+
+def note_first_refused(body: str) -> None:
+    """Call when Himalayas' spam filter refuses a first message. Future drafts avoid that wording."""
+    text = (body or "").strip()
+    if not text:
+        return
+    items = _load_message_list(REFUSED_STATE_KEY)
+    items.append(text)
+    _save_message_list(REFUSED_STATE_KEY, items, REFUSED_KEEP)
+
+
+def style_guide_for_prompt(limit: int = 3) -> str:
+    """Few accepted examples + refused ones so the model copies the winning voice, not the failed one."""
+    winners = winning_first_messages(limit)
+    refused = refused_first_messages(2)
+    parts: list[str] = []
+    if winners:
+        shown = "\n".join(f"---\n{text}" for text in winners)
+        parts.append(
+            "MESSAGES HIMALAYAS ALREADY ACCEPTED (match this length, tone, and structure: short greeting with the name, "
+            "one concrete work detail, company + role named once, one soft yes/no question. Change the personal detail "
+            "and wording so it is not a copy)\n"
+            f"{shown}"
+        )
+    if refused:
+        shown = "\n".join(f"---\n{text}" for text in refused)
+        parts.append(
+            "MESSAGES HIMALAYAS REFUSED (do not reuse this wording, length pattern, or pitchy tone)\n"
+            f"{shown}"
+        )
+    return ("\n\n" + "\n\n".join(parts) + "\n") if parts else ""
+
+
+def assemble_first_message(candidate: dict, role: str, detail: str, company: str | None = None) -> str:
     """The greeting, the hiring sentence, and the closing line are chosen in code, so grammar and structure are always right.
     The model only supplies the one personal detail."""
     greeting = next(greeting_cycle).format(name=greeting_name(candidate["name"]))
-    return random.choice(LAYOUTS).format(greeting=greeting, detail=detail, hiring=hiring_sentence(role), closer=next(closer_cycle))
-
-
-def neutral_first_message(candidate: dict, role: str) -> str:
-    """Used when the model cannot produce an acceptable detail. It says nothing about the candidate that is not certain."""
-    greeting = next(greeting_cycle).format(name=greeting_name(candidate["name"]))
-    return f"{greeting} I came across your profile. {hiring_sentence(role)} {next(closer_cycle)}"
-
-
-def sparse_first_message(candidate: dict) -> dict:
-    """A near-empty profile gives nothing true to mention, so the message makes no claim about the candidate."""
-    role = fallback_role(candidate)
-    return {"role": role, "message": neutral_first_message(candidate, role)}
-
-
-def acceptable_detail(detail: str, role: str) -> bool:
-    lowered = detail.lower()
-    return (
-        bool(detail) and not SPAM_TERMS.search(detail) and 6 <= len(detail.split()) <= 32
-        and role.lower() not in lowered and COMPANY_NAME.lower() not in lowered
-        and not re.search(r"\b[A-Z]{4,}\b", detail)  # no acronyms or shouting
+    return random.choice(LAYOUTS).format(
+        greeting=greeting, detail=detail, hiring=hiring_sentence(role, company), closer=next(closer_cycle),
     )
 
+
+def neutral_first_message(candidate: dict, role: str, company: str | None = None) -> str:
+    """Used when the model cannot produce an acceptable detail. It says nothing about the candidate that is not certain."""
+    greeting = next(greeting_cycle).format(name=greeting_name(candidate["name"]))
+    return f"{greeting} I came across your profile. {hiring_sentence(role, company)} {next(closer_cycle)}"
+
+
+def sparse_first_message(candidate: dict, company: str | None = None) -> dict:
+    """A near-empty profile gives nothing true to mention, so the message makes no claim about the candidate."""
+    role = fallback_role(candidate)
+    return {"role": role, "message": neutral_first_message(candidate, role, company)}
+
+def acceptable_detail(detail: str, role: str, company: str | None = None) -> bool:
+    lowered = detail.lower()
+    company_name = (company or COMPANY_NAME).lower()
+    return (
+        bool(detail) and not SPAM_TERMS.search(detail) and 6 <= len(detail.split()) <= 32
+        and role.lower() not in lowered and company_name not in lowered
+        and not re.search(r"\b[A-Z]{4,}\b", detail)  # no acronyms or shouting
+    )
 
 ARTICLE_MISTAKE = re.compile(r"\ba (?=[AEIOUaeiou])|\ban (?=[BCDFGHJKLMNPQRSTVWXYZbcdfghjklmnpqrstvwxyz])")
 
 
-def acceptable_first_message(text: str, role: str) -> bool:
+def acceptable_first_message(text: str, role: str, company: str | None = None) -> bool:
     lowered = text.lower()
+    company_name = (company or COMPANY_NAME).lower()
     if ARTICLE_MISTAKE.search(text) or re.search(r"\b(\w+) \1\b", lowered):  # a/an mistakes and doubled words
         return False
+    words = len(text.split())
+    # Match accepted sends (~228–302 chars, ~38–52 words, one soft question).
+    if not (35 <= words <= 55 and 200 <= len(text) <= 320):
+        return False
+    if text.count("?") > 1:
+        return False
     # The company and the role are each named once. Repeating them reads like padding.
-    return bool(text) and not SPAM_TERMS.search(text) and len(text.split()) <= 60 and lowered.count(role.lower()) == 1 and lowered.count(COMPANY_NAME.lower()) == 1
+    return bool(text) and not SPAM_TERMS.search(text) and lowered.count(role.lower()) == 1 and lowered.count(company_name) == 1
 
 
-async def write_first_message(candidate: dict, fixed_role: str | None = None, recent: list[str] | None = None) -> dict:
-    """Step 1. Returns {"role", "message"}. One call picks the ONE closest role (or uses fixed_role) and writes ONE personal sentence.
-    The rest of the message is put together in code from rotating phrasings, so it is always well formed and never the same twice.
-    A message too much like one of the `recent` messages (or one that was refused) is built again. There is no skip."""
+async def write_first_message(
+    candidate: dict,
+    fixed_role: str | None = None,
+    recent: list[str] | None = None,
+    *,
+    account_id: str | None = None,
+    client: dict | None = None,
+) -> dict:
+    """Step 1. Full first-touch message written by the model (DeepSeek via OpenRouter). Recruiting-agency voice."""
+    hiring = resolve_client(client, account_id)
+    company = hiring["name"]
     if PROMPTS.get("mode") == "prompt":
         from . import prompted
-        return await prompted.first_message(candidate, fixed_role, recent)
+        return await prompted.first_message(candidate, fixed_role, recent, account_id=account_id, client=hiring)
+
+    from .hiring_client import client_prompt_block
+
+    role_step = (
+        f'The role is exactly "{fixed_role}". Use that role name once in the message.'
+        if fixed_role
+        else "Choose the ONE role that suits the candidate best and use that exact role name once in the message."
+    )
+    avoid = list(recent or []) + refused_first_messages(6) + winning_first_messages(6)
+    guide = style_guide_for_prompt(3)
+    sparse_note = ""
     if is_sparse(candidate):
-        return sparse_first_message({**candidate}) if not fixed_role else {"role": fixed_role, "message": neutral_first_message(candidate, fixed_role)}
-    role_step = f'The role is "{fixed_role}".' if fixed_role else "Choose the ONE role that suits the candidate best."
-    result = {"role": fixed_role, "message": ""}
-    for attempt in range(4):
-        prompt = f"""You help a recruiter at {COMPANY_NAME}. We are hiring for these roles.
+        sparse_note = (
+            "\nThe profile is thin. Do not invent work history. Greet them, note you are recruiting for "
+            f"a {company} role, name the role, and ask if they are open to a short chat.\n"
+        )
+    result = {"role": fixed_role or fallback_role(candidate), "message": ""}
+    for attempt in range(5):
+        prompt = f"""Write ONE complete first outreach message from a recruiting agency to a freelance-platform member.
+The entire message must be your own wording. Do not leave placeholders. Do not return only a fragment.
+
+{client_prompt_block(hiring, first_message=True)}
+
+Open roles at {company} (pick one unless a role is fixed):
 {role_list_for_prompt()}
 
 {ROLE_CHOICE_RULES}
 
 {candidate_block(candidate)}
-
+{guide}{sparse_note}
 TASK
 1. {role_step}
-2. Write ONE short, warm sentence of 10 to 25 words that names one real detail from the profile, the way one person writes to another. {next(starter_cycle)}.
-   - Use plain everyday words. No technical acronyms, protocol names, or product names for the work. No all-capital words.
-   - Do not infer or add skills that the profile does not state. If the match is only partial, name a real strength that carries over and do not overstate the fit.
-   - Do NOT mention the role, the company, hiring, or a question. Do not greet the person. Only the one sentence about their work.
-   - Never write the words crypto, trading, platform, invest, profit, or token. No links, prices, or percentages. No marketing words such as exciting or amazing.{FIRST_MESSAGE_INSTRUCTIONS}
+2. Write the FULL message (greeting through soft question) in plain text.
+Structure (professional agency first touch — about 40 to 52 words, roughly 220–310 characters):
+- Greeting with the member's first name as given for display: {greeting_name(candidate["name"])}
+- One concrete line about their background (only if the profile supports it)
+- Light recruiter framing + the role at {company} once
+- One soft question (open to a chat / interested?)
+Rules:
+- Plain everyday words. No markdown, no links, no pay, no process steps.
+- Never write crypto, trading, platform, invest, profit, or token.
+- Do not pitch your recruiting firm. Do not invent client facts.
+- The role name and "{company}" each appear exactly once.
+- At most one question mark.
+- Must not closely copy earlier messages if any are listed below.
+{FIRST_MESSAGE_INSTRUCTIONS}
 
-Return only JSON: {{"role": "<exact role name from the list>", "detail": "<the one sentence>"}}"""
-        data = parse_json(await complete(prompt, max_tokens=250, temperature=0.9))
+Return only JSON: {{"role": "<exact role name from the list>", "message": "<the full message>"}}"""
+        data = parse_json(await complete(prompt, max_tokens=350, temperature=0.85))
         role = fixed_role or match_role(data.get("role"))
-        detail = clean(str(data.get("detail", "")))
-        if detail and detail[-1] not in ".!":
-            detail += "."
-        result = {"role": role, "message": ""}
-        if not (role and acceptable_detail(detail, role)):
+        message = clean(str(data.get("message", "")))
+        result = {"role": role or result["role"], "message": message}
+        if not (role and message):
             continue
-        message = assemble_first_message(candidate, role, detail[0].upper() + detail[1:])
-        if acceptable_first_message(message, role) and not too_similar(message, greeting_name(candidate["name"]), recent):
-            return {"role": role, "message": message}
-    role = result["role"] or fallback_role(candidate)
-    return {"role": role, "message": neutral_first_message(candidate, role)}
+        if not acceptable_first_message(message, role, company):
+            continue
+        if too_similar(message, greeting_name(candidate["name"]), avoid, limit=0.28):
+            continue
+        return {"role": role, "message": message}
 
+    # Last attempt: still full message from the model, looser acceptance (length only / spam).
+    role = result["role"] or fallback_role(candidate)
+    fallback_prompt = f"""Write a short professional first outreach as a recruiter hiring FOR {company}.
+Greet {greeting_name(candidate["name"])}. Say you are a recruiter on a search for {a_role_phrase(role)} at {company}.
+Ask if they are open to a brief chat. About 40–50 words. No links, no pay, no crypto/trading/platform words.
+Return only the message text."""
+    try:
+        text = clean(await complete(fallback_prompt, max_tokens=220, temperature=0.6))
+        if text and not SPAM_TERMS.search(text) and 25 <= len(text.split()) <= 60:
+            return {"role": role, "message": text}
+    except Exception:
+        pass
+    # Absolute last resort if the model is down — still agency-shaped, not "we are the company".
+    return {
+        "role": role,
+        "message": (
+            f"Hi {greeting_name(candidate['name'])}, I'm a recruiter working a search for "
+            f"{a_role_phrase(role)} at {company}. Would you be open to a short chat?"
+        ),
+    }
+
+
+def a_role_phrase(role: str) -> str:
+    return ("an " if role[:1].upper() in "AEIOU" else "a ") + role
 
 async def choose_role(candidate: dict) -> str:
     """Fallback for candidates that were contacted before roles were stored. Always returns a role."""
@@ -538,7 +715,7 @@ INTRO_LEVELS = 2
 THANKS = ("Thank you for your reply.", "Thanks for getting back to me.", "Great to hear from you.", "Thank you for your interest.", "Thanks for your answer.")
 BUSINESS_LINES = (
     "{company} builds AI technology for digital asset markets.",
-    "At {company} we build AI tools for digital asset markets, with strict risk controls.",
+    "{company} builds AI tools for digital asset markets, with strict risk controls.",
     "{company} develops AI technology that works in digital asset markets.",
     "{company} is a team building AI technology for digital asset markets.",
 )
@@ -548,11 +725,17 @@ business_cycle = itertools.cycle(random.sample(BUSINESS_LINES, len(BUSINESS_LINE
 website_cycle = itertools.cycle(random.sample(WEBSITE_LINES, len(WEBSITE_LINES)))
 
 
-def intro_message(candidate: dict, role: str, level: int) -> str:
+def intro_message(candidate: dict, role: str, level: int, company: str | None = None, about_line: str | None = None) -> str:
     """Levels 1 and 2. Fixed building blocks, so the wording is known to be free of the words that were refused. The role line for a
     business role comes from its job description. Developer roles have none on file, so nothing is invented for them."""
+    name = company or COMPANY_NAME
     parts = []
-    sentences = [next(thanks_cycle), next(business_cycle).format(company=COMPANY_NAME)]
+    company_line = about_line.strip() if about_line and about_line.strip() else next(business_cycle).format(company=name)
+    if "{company}" in company_line:
+        company_line = company_line.format(company=name)
+    elif name.lower() not in company_line.lower():
+        company_line = f"{name}: {company_line}" if company_line else next(business_cycle).format(company=name)
+    sentences = [next(thanks_cycle), company_line]
     if role in NON_DEV_ROLES:
         summary = NON_DEV_ROLES[role]["summary"]
         sentences.append(f"The {role} {summary[0].lower()}{summary[1:]}")  # each summary starts with a verb: "Owns brand, growth..."
@@ -565,40 +748,79 @@ def intro_message(candidate: dict, role: str, level: int) -> str:
     return "\n\n".join(parts)
 
 
-async def write_intro(candidate: dict, role: str, level: int = 0) -> str:
-    """Step 2. Company introduction with the website, the rate, then one question about interest and confidence.
-    Level 0 is written by the model. Levels 1 and 2 are built from fixed parts (see above)."""
-    if level >= 1:
-        return intro_message(candidate, role, min(level, INTRO_LEVELS))
-
+async def write_intro(
+    candidate: dict, role: str, level: int = 0, *, account_id: str | None = None, client: dict | None = None,
+) -> str:
+    """Step 2. After interest: introduce the *client* company (agency voice). Full text from the model."""
+    hiring = resolve_client(client, account_id)
+    company = hiring["name"]
+    about = hiring.get("about") or ""
     facts = role_facts(role)
-    prompt = f"""You are a professional recruiter for {COMPANY_NAME}. The candidate replied with interest in the {role} role.
+    from .hiring_client import client_prompt_block
 
-{OCEANPARKASSET_CONTEXT}
-{('Role facts: ' + facts) if facts else ''}
+    website_rule = (
+        f"- Include the website {COMPANY_WEBSITE} exactly once as plain text."
+        if level < 2
+        else "- Do not include a website or link in this message."
+    )
+    if level >= 1:
+        website_rule = (
+            f"- If you mention a site, write it as plain text only (for example {COMPANY_WEBSITE.replace('https://www.', '').rstrip('/')}), never as a markdown link."
+            if level == 1
+            else "- Do not include a website or link."
+        )
+
+    prompt = f"""Write ONE complete follow-up message as a recruiter who already got a positive reply.
+The entire message must be your own wording.
+
+PRIMARY PURPOSE OF THIS MESSAGE (important): introduce the client company {company}.
+The first outreach only named {company}. This reply is where you properly explain who {company} is and what they do.
+
+{client_prompt_block(hiring)}
+
+Client brief (must drive the company introduction — do not invent beyond it):
+{about or OCEANPARKASSET_CONTEXT}
+{('Role facts (optional one short sentence about what the role does): ' + facts) if facts else 'No extra role duties on file — do not invent duties.'}
 {candidate_block(candidate)}
 
 TASK
-Write a clear, professional message (about 60 to 90 words) that:
-- thanks the candidate in one short sentence for their interest,
-- explains what {COMPANY_NAME} does in two short sentences (plain language),{' and says in one short sentence what the ' + role + ' does, using only the role facts,' if facts else ''}
-- includes the website {COMPANY_WEBSITE} exactly as written.
-Do NOT ask a question. Do NOT mention pay, rate, or compensation. The system adds them.
-Sound like a real recruiter, not a template. Stay calm and direct.
+The member showed interest in the {role} role at {company}. Write 60–90 words that:
+- thank them briefly for their interest,
+- introduce {company} clearly in one or two short sentences from the client brief (name must appear; say what they do),
+- optionally one plain sentence on what the {role} owns (only from role facts),
+{website_rule}
+- do NOT ask a question (the system adds the interest/confidence question),
+- do NOT mention pay or compensation,
+- do not pitch your recruiting firm; stay focused on {company} and the role.
 
 {WRITING_RULES.replace('{name}', candidate['name'])}
 
 Return only the message."""
     text = ""
     for _ in range(3):
-        text = drop_name(clean(await complete(prompt, max_tokens=320)), candidate["name"])
-        if not mentions_pay(text):
+        text = drop_name(clean(await complete(prompt, max_tokens=320, temperature=0.7)), candidate["name"])
+        if text and not mentions_pay(text) and not SPAM_TERMS.search(text) and company.lower() in text.lower():
             break
     else:
-        # The model kept mentioning pay. Only the official rate text may appear, so drop those sentences.
-        text = " ".join(sentence for sentence in re.split(r"(?<=[.?!])\s+", text) if not mentions_pay(sentence))
-    if COMPANY_WEBSITE not in text:
-        text = f"{text}\nWebsite: {COMPANY_WEBSITE}"
+        text = " ".join(sentence for sentence in re.split(r"(?<=[.?!])\s+", text or "") if not mentions_pay(sentence))
+        if text and company.lower() not in text.lower():
+            text = f"{text} {company} {about or 'is hiring.'}".strip()
+    if not text.strip():
+        # Model failed — one more constrained generation rather than a canned template block.
+        text = clean(await complete(
+            f"Thank them for interest in {role} at {company}. "
+            f"Properly introduce {company}: {about or company + ' is hiring.'} "
+            f"Name {company} and say what they do. No question, no pay, no links. 50–70 words.",
+            max_tokens=220,
+            temperature=0.5,
+        ))
+        text = drop_name(text, candidate["name"])
+        if text and company.lower() not in text.lower():
+            text = f"{company}: {about or 'is hiring.'} {text}".strip()
+    if level == 1 and COMPANY_WEBSITE not in text and "oceanparkasset" in (COMPANY_WEBSITE or ""):
+        site = COMPANY_WEBSITE.replace("https://www.", "").rstrip("/")
+        if site not in text:
+            text = f"{text}\nMore about the company: {site}."
     parts = [text]
     if role_rate(role):
         parts.append(role_rate(role))
@@ -606,16 +828,22 @@ Return only the message."""
     return "\n\n".join(parts)
 
 
-async def write_experience(candidate: dict, role: str) -> str:
+async def write_experience(
+    candidate: dict, role: str, *, account_id: str | None = None, client: dict | None = None,
+) -> str:
     """Step 3. A short, professional experience check based on the member's profile, then one open question."""
+    hiring = resolve_client(client, account_id)
+    company = hiring["name"]
     facts = role_facts(role)
-    prompt = f"""You are a professional recruiter for {COMPANY_NAME}. The candidate is interested in the {role} role.
+    from .hiring_client import client_prompt_block
+    prompt = f"""You are a professional recruiter hiring FOR {company} (recruiting firm, not their employee).
+{client_prompt_block(hiring)}
 
 {('Role facts: ' + facts) if facts else f'This is a {role} role. Do not invent duties that are not given.'}
 {candidate_block(candidate)}
 
 TASK
-Write a professional message (about 50 to 90 words) that sounds like a real hiring conversation:
+Write a professional message (about 50 to 90 words) that sounds like a real hiring conversation for {company}:
 - thank them briefly for sharing how they feel about the role,
 - mention ONE or TWO real details from their profile (skills, tools, or past work) in plain words. If the profile is thin, say nothing invented about them,
 - ask about their recent experience in a way that fits this role (for example a project, stack, client work, or responsibility). Keep it open and natural,
@@ -670,8 +898,9 @@ def render(template: str, **values: str) -> str:
     return PLACEHOLDER.sub(lambda match: str(values.get(match.group(1), match.group(0))), template)
 
 
-def company_values() -> dict:
-    return {"company": COMPANY_NAME, "website": COMPANY_WEBSITE, "careers": CAREERS_URL}
+def company_values(client: dict | None = None, account_id: str | None = None) -> dict:
+    hiring = resolve_client(client, account_id)
+    return {"company": hiring["name"], "website": COMPANY_WEBSITE, "careers": CAREERS_URL}
 
 
 def process_message(name: str, role: str | None = None) -> str:
@@ -685,9 +914,15 @@ def process_message(name: str, role: str | None = None) -> str:
     return f"{render(text, **values)} {PENDING_QUESTIONS['process_sent']}"
 
 
-async def write_assessment(candidate: dict, role: str) -> str:
+async def write_assessment(
+    candidate: dict, role: str, *, account_id: str | None = None, client: dict | None = None,
+) -> str:
     """Step 5a. Assessment overview for the role and the candidate's skills, then the GitHub username question."""
-    prompt = f"""You are a professional recruiter for {COMPANY_NAME}. The candidate agreed to the hiring process. The next step is the technical assessment.
+    hiring = resolve_client(client, account_id)
+    company = hiring["name"]
+    from .hiring_client import client_prompt_block
+    prompt = f"""You are a professional recruiter hiring FOR {company} (recruiting firm, not their employee).
+{client_prompt_block(hiring)}
 
 {candidate_block(candidate)}
 Role: {role}
@@ -697,7 +932,7 @@ TASK
 Write a clear, professional message (about 60 to 90 words) that:
 - thanks the candidate in one short sentence for agreeing to the process,
 - explains the assessment for the {role} role. Connect it to one or two skills from the candidate's profile (for example Node, React, Python, backend, frontend, AI). Use only the assessment facts above.
-- says that {COMPANY_NAME} will invite the candidate to a GitHub project for the assessment,
+- says that {company} will invite the candidate to a GitHub project for the assessment,
 - ends with this question: "{PENDING_QUESTIONS['assessment_sent']}"
 
 {WRITING_RULES.replace('{name}', candidate['name'])}
@@ -729,13 +964,20 @@ def username_not_found_message(name: str, username: str) -> str:
     return render(MESSAGES["username_not_found"], username=username, **company_values())
 
 
-async def draft_answer(candidate: dict, stage: str, conversation: list[dict], reply: str, role: str) -> str:
+async def draft_answer(
+    candidate: dict, stage: str, conversation: list[dict], reply: str, role: str,
+    *, account_id: str | None = None, client: dict | None = None,
+) -> str:
     """Unplanned situations: answer the candidate briefly, then repeat the question that is still open."""
+    hiring = resolve_client(client, account_id)
+    company = hiring["name"]
     pending = PENDING_QUESTIONS.get(stage, "")
     history = "\n".join(f"{item['direction']}: {item['body']}" for item in conversation[-8:])
-    prompt = f"""You are a recruiter for {COMPANY_NAME}. The candidate wrote a message that is not a simple yes or no.
+    from .hiring_client import client_prompt_block
+    prompt = f"""You are a recruiter (recruiting firm) hiring FOR {company}. You are not an employee of {company}.
+{client_prompt_block(hiring)}
 
-{OCEANPARKASSET_CONTEXT}
+Client brief: {hiring.get('about') or OCEANPARKASSET_CONTEXT}
 {candidate_block(candidate)}
 Role we suggested: {role}
 {('Role facts (the only details you may give about the role): ' + role_facts(role)) if role_facts(role) else 'Role details: none on file. Do not describe duties, requirements, tools, or what the company looks for, and do not present the candidate\'s own skills as company requirements. If asked about the role, say only that the team will discuss it in a later step of the process.'}
@@ -797,14 +1039,17 @@ def answer_is_safe(text: str, role: str) -> bool:
     return not any(REFUSAL.search(sentence) and PAY_WORDS.search(sentence) for sentence in re.split(r"(?<=[.?!])\s+|\n+", text))
 
 
-async def write_answer(candidate: dict, stage: str, conversation: list[dict], reply: str, role: str) -> str:
+async def write_answer(
+    candidate: dict, stage: str, conversation: list[dict], reply: str, role: str,
+) -> str:
     """Unplanned situations: answer the candidate briefly, then repeat the question that is still open."""
+    account_id = candidate.get("account_id")
     for _ in range(3):
-        text = await draft_answer(candidate, stage, conversation, reply, role)
+        text = await draft_answer(candidate, stage, conversation, reply, role, account_id=account_id)
         if answer_is_safe(text, role):
             return text
     # The model kept breaking a pay rule. Send a safe fixed reply instead.
-    parts = [render(MESSAGES["fallback_answer"], **company_values())]
+    parts = [render(MESSAGES["fallback_answer"], **company_values(account_id=account_id))]
     if role_rate(role):
         parts.append(role_rate(role))
     parts.append("The team will discuss other terms in a later step of the process.")

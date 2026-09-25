@@ -109,10 +109,66 @@ function renderConversationDetail(data) {
 }
 async function loadConversation(candidateId) { selectedConversation = candidateId; await request(`/api/conversations/${candidateId}/read`, {method: 'POST'}); const data = await request(`/api/conversations/${candidateId}`); renderConversationDetail(data); renderConversations(await request('/api/conversations')); }
 async function loadConversations() { const items = await request('/api/conversations'); renderConversations(items); if (selectedConversation) renderConversationDetail(await request(`/api/conversations/${selectedConversation}`)); }
+async function pingServer() {
+  // Online/offline is only about reachability. Do not require account data to succeed.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 4000);
+  try {
+    const response = await fetch(`${API}/api/health`, {signal: controller.signal});
+    return response.ok;
+  } catch (error) {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function refresh() {
   if (refreshing) return;
   refreshing = true;
-  try { const [health, allCandidates, progress, activity] = await Promise.all([request('/api/health'), request('/api/candidates'), request('/api/progress'), request('/api/activity')]); const candidates = allCandidates.filter((item) => candidatePage(item) === currentPage); $('service-dot').className = 'service-dot online'; setServerButton(true); $('status').textContent = health.hold ? `Sending on hold: ${health.hold}` : `Service online · auto-send ${health.auto_send ? 'on' : 'off'}`; $('auth').textContent = health.himalayas_authorized ? 'Himalayas connected' : health.himalayas_login === 'expired' ? 'Login expired · Reconnect' : 'Connect Himalayas'; $('page-title').textContent = `Page ${currentPage}`; $('previous').disabled = currentPage === 1; $('page-count').textContent = candidates.length; $('last-updated').textContent = new Date().toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}); renderActivity(activity); renderProgress(progress, health.delivery); updateMetrics(allCandidates, candidates, progress); updateAutomation(health.automation); await loadConversations(); } catch (error) { $('service-dot').className = 'service-dot error'; $('status').textContent = 'Server offline · click Start server'; setServerButton(false); $('auth').textContent = 'Connect Himalayas'; } finally { refreshing = false; }
+  try {
+    const online = await pingServer();
+    if (!online) {
+      $('service-dot').className = 'service-dot error';
+      $('status').textContent = 'Server offline · click Start server';
+      setServerButton(false);
+      $('auth').textContent = 'Connect Himalayas';
+      return;
+    }
+    setServerButton(true);
+    try {
+      const [health, allCandidates, progress, activity] = await Promise.all([
+        request('/api/health'), request('/api/candidates'), request('/api/progress'), request('/api/activity'),
+      ]);
+      const candidates = allCandidates.filter((item) => candidatePage(item) === currentPage);
+      $('service-dot').className = 'service-dot online';
+      $('status').textContent = health.hold
+        ? `Sending on hold: ${health.hold}`
+        : `Service online · auto-send ${health.auto_send ? 'on' : 'off'}`;
+      $('auth').textContent = health.himalayas_authorized
+        ? 'Himalayas connected'
+        : health.himalayas_login === 'expired'
+          ? 'Login expired · Reconnect'
+          : 'Connect Himalayas';
+      $('page-title').textContent = `Page ${currentPage}`;
+      $('previous').disabled = currentPage === 1;
+      $('page-count').textContent = candidates.length;
+      $('last-updated').textContent = new Date().toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+      renderActivity(activity);
+      renderProgress(progress, health.delivery);
+      updateMetrics(allCandidates, candidates, progress);
+      updateAutomation(health.automation);
+      await loadConversations();
+    } catch (error) {
+      // Server is up; this profile's data call failed (account / API). Do not claim the server is offline.
+      $('service-dot').className = 'service-dot online';
+      let detail = error.message || 'unknown error';
+      try { detail = JSON.parse(error.message).detail || detail; } catch (parseError) { /* plain text */ }
+      $('status').textContent = `Server online · could not load this profile: ${String(detail).slice(0, 120)}`;
+    }
+  } finally {
+    refreshing = false;
+  }
 }
 async function syncPage() { $('sync').disabled = true; $('sync').textContent = 'Syncing...'; $('status').textContent = `Loading page ${currentPage} from MCP...`; try { const result = await request(`/api/candidates/sync?page=${currentPage}`, {method: 'POST'}); await refresh(); $('status').textContent = `Page ${currentPage} synced · ${result.imported} profiles`; } catch (error) { $('status').textContent = `Sync failed: ${error.message}`; throw error; } finally { $('sync').disabled = false; $('sync').textContent = 'Sync page'; } }
 $('sync').onclick = syncPage;
@@ -125,14 +181,37 @@ const NATIVE_HOST = 'com.himalayas.hiring_assistant';
 let serverRunning = false;
 function setServerButton(running) { serverRunning = running; $('server-toggle').textContent = running ? 'Stop server' : 'Start server'; }
 function callNativeHost(action) {
-  return new Promise((resolve, reject) => chrome.runtime.sendNativeMessage(NATIVE_HOST, {action}, (reply) => chrome.runtime.lastError ? reject(new Error(chrome.runtime.lastError.message)) : resolve(reply)));
+  return new Promise((resolve, reject) => chrome.runtime.sendNativeMessage(NATIVE_HOST, {action}, (reply) => chrome.runtime.lastError ? reject(new Error(chrome.runtime.lastError.message)) : resolve(reply || {})));
 }
 $('server-toggle').onclick = async () => {
-  const button = $('server-toggle'); const action = serverRunning ? 'stop' : 'start';
-  button.disabled = true; $('status').textContent = action === 'start' ? 'Starting server...' : 'Stopping server...';
-  try { const reply = await callNativeHost(action); $('status').textContent = reply.message; await refresh(); if (!reply.running) { $('service-dot').className = 'service-dot error'; setServerButton(false); if (reply.ok) $('status').textContent = reply.message; } }
-  catch (error) { $('status').textContent = /not found|forbidden/i.test(error.message) ? 'Helper not installed. Run scripts/install-native-host.sh, then reload the extension.' : `Server control failed: ${error.message}`; }
-  finally { button.disabled = false; }
+  const button = $('server-toggle');
+  const action = serverRunning ? 'stop' : 'start';
+  button.disabled = true;
+  $('status').textContent = action === 'start' ? 'Starting server...' : 'Stopping server...';
+  try {
+    const reply = await callNativeHost(action);
+    $('status').textContent = reply.message || (action === 'start' ? 'Server started' : 'Server stopped');
+    // Always re-check health — native host and this Chrome profile must agree.
+    const online = await pingServer();
+    setServerButton(online);
+    $('service-dot').className = online ? 'service-dot online' : 'service-dot error';
+    if (online) await refresh();
+    else $('status').textContent = reply.message || 'Server offline · click Start server';
+  } catch (error) {
+    const online = await pingServer();
+    setServerButton(online);
+    $('service-dot').className = online ? 'service-dot online' : 'service-dot error';
+    if (online) {
+      $('status').textContent = 'Server is running (helper could not control it). Reloaded status.';
+      await refresh();
+    } else if (/not found|forbidden|Specified native messaging host not found/i.test(error.message)) {
+      $('status').textContent = 'Helper not installed. Run scripts/install-native-host.sh, then reload the extension.';
+    } else {
+      $('status').textContent = `Server control failed: ${error.message}`;
+    }
+  } finally {
+    button.disabled = false;
+  }
 };
 $('auth').onclick = async () => { window.open(`${API}/api/auth/start?account_id=${encodeURIComponent(await accountReady)}`, '_blank'); };
 $('dashboard-tab').onclick = () => showTab('dashboard');
