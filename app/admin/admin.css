@@ -146,6 +146,8 @@ label{display:block;margin:10px 0 4px;color:var(--muted);font:10px 'DM Mono',mon
 .tag.sent{background:#263b25;color:var(--lime)}
 .tag.failed{background:#3a1f1d;color:var(--red)}
 .tag.scheduled,.tag.approved,.tag.queued{background:#3a2c1c;color:var(--orange)}
+.tag.pending,.tag.not_sent{background:#1c2430;color:#9db0c7}
+.tag.skip,.tag.skipped{background:#2a2a2e;color:#a8a8b0}
 .tag.received{background:#1c2a3a;color:var(--blue)}
 .retry{padding:3px 10px;font-size:11px;background:transparent;border:1px solid var(--lime-dark);color:var(--lime)}
 .clean-summary{margin:10px 0;padding:10px 12px;border:1px solid var(--line);border-radius:6px;background:var(--panel-2);font-size:12px}

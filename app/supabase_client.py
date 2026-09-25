@@ -348,6 +348,11 @@ PROFILES_BASE_SELECT = (
 PROFILES_OPTIONAL = (
     "summary", "error", "account_id", "account_label", "message_body", "sent_at",
 )
+# List/browse omits large text fields; detail (get) still loads them.
+PROFILES_LIST_COLS = (
+    "id,talent_slug,candidate_name,profile_url,category,country,status,created_at,updated_at,"
+    "error,account_id,account_label,sent_at"
+)
 
 
 class TalentProfiles:
@@ -386,13 +391,12 @@ class TalentProfiles:
         cls._columns = set(rows[0].keys()) if rows else set(PROFILES_BASE_SELECT.split(","))
         return cls._columns
 
-    async def _select(self) -> str:
+    async def _select(self, *, for_list: bool = False) -> str:
         available = await self.columns()
-        parts = [c for c in PROFILES_BASE_SELECT.split(",") if c in available]
-        for col in PROFILES_OPTIONAL:
-            if col in available:
-                parts.append(col)
-        return ",".join(parts)
+        wanted = PROFILES_LIST_COLS.split(",") if for_list else (
+            list(PROFILES_BASE_SELECT.split(",")) + list(PROFILES_OPTIONAL)
+        )
+        return ",".join(c for c in wanted if c in available)
 
     def _filter_payload(self, payload: dict, available: set[str]) -> dict:
         return {k: v for k, v in payload.items() if k in available}
@@ -418,6 +422,92 @@ class TalentProfiles:
         rows = response.json()
         return rows if isinstance(rows, list) else []
 
+    @staticmethod
+    def _normalize_row(row: dict) -> dict:
+        """Empty outreach status → not_sent for the dashboard (no first message yet)."""
+        out = dict(row)
+        status = (out.get("status") or "").strip()
+        out["status"] = status or "not_sent"
+        return out
+
+    async def list_all(
+        self,
+        *,
+        status: str | None = None,
+        q: str | None = None,
+        offset: int = 0,
+        limit: int = 50,
+        account_id: str | None = None,
+    ) -> dict:
+        """Browse every talent_profiles row for the control-dashboard ledger.
+
+        Returns {total, offset, limit, contacts} (same shape as the old outreach_contacts ledger).
+        status: not_sent (empty), queued, sent, failed, skip — or None for all rows.
+        """
+        limit = max(1, min(limit, 200))
+        offset = max(0, offset)
+        needle = (q or "").replace(",", " ").replace(".", " ").strip()
+        available = await self.columns()
+        params: dict[str, str] = {
+            "select": await self._select(for_list=True),
+            # id is the primary key — cheap to page even on large archives.
+            "order": "id.desc",
+            "limit": str(limit),
+            "offset": str(offset),
+        }
+        search_fields = [f for f in ("candidate_name", "talent_slug", "account_label", "country", "category") if f in available]
+        search_or = "(" + ",".join(f"{field}.ilike.*{needle}*" for field in search_fields) + ")" if needle and search_fields else ""
+        status_not_sent = "(status.eq.,status.is.null)"
+        # "pending" kept as an alias for older bookmarks / clients.
+        wants_not_sent = status in {"not_sent", "pending"}
+
+        if wants_not_sent and search_or:
+            params["and"] = f"(or{status_not_sent},or{search_or})"
+        elif wants_not_sent:
+            params["or"] = status_not_sent
+        elif status and search_or:
+            params["status"] = f"eq.{status}"
+            params["or"] = search_or
+        elif status:
+            params["status"] = f"eq.{status}"
+        elif search_or:
+            params["or"] = search_or
+
+        if account_id and "account_id" in available:
+            params["account_id"] = f"eq.{account_id}"
+
+        # Prefer estimated count — exact COUNT(*) times out on large talent_profiles archives.
+        headers = {**self.headers, "Prefer": "count=estimated"}
+        try:
+            async with httpx.AsyncClient(timeout=45) as client:
+                response = await client.get(self.endpoint, headers=headers, params=params)
+                if response.is_error and (
+                    response.status_code == 500 or "timeout" in (response.text or "").lower()
+                ):
+                    response = await client.get(self.endpoint, headers=self.headers, params=params)
+        except httpx.HTTPError as exc:
+            raise SupabaseError(f"Could not reach Supabase talent_profiles: {type(exc).__name__}") from exc
+        if response.is_error:
+            raise SupabaseError(f"talent_profiles list failed ({response.status_code}): {response.text}")
+        total = None
+        content_range = response.headers.get("content-range") or ""
+        if "/" in content_range:
+            try:
+                total = int(content_range.rsplit("/", 1)[-1])
+            except ValueError:
+                total = None
+        raw = response.json()
+        rows = raw if isinstance(raw, list) else []
+        if total is None:
+            total = offset + len(rows) + (1 if len(rows) >= limit else 0)
+        return {
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "contacts": [self._normalize_row(row) for row in rows],
+            "source": "talent_profiles",
+        }
+
     async def get(self, talent_slug: str) -> dict | None:
         try:
             async with httpx.AsyncClient(timeout=20) as client:
@@ -431,7 +521,9 @@ class TalentProfiles:
         if response.is_error:
             raise SupabaseError(f"talent_profiles lookup failed ({response.status_code}): {response.text}")
         rows = response.json()
-        return rows[0] if rows else None
+        if not rows:
+            return None
+        return self._normalize_row(rows[0])
 
     async def claim(self, talent_slug: str, account_id: str, account_label: str = "") -> bool:
         """Atomically claim a pending row as queued for this account. Returns False if another bot owns it or it is sent/skip."""

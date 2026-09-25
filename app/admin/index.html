@@ -62,7 +62,7 @@
           <button id="ledger-refresh" class="secondary">Refresh</button>
         </div>
       </div>
-      <p id="ledger-note" class="note">Members stored in the shared Supabase contact ledger (every profile checks this before a first message).</p>
+      <p id="ledger-note" class="note">All members in Supabase <b>talent_profiles</b> (not sent, queued, sent, failed, skip). Same table bots use for first outreach.</p>
       <div class="table-wrap">
         <table id="ledger-table">
           <thead><tr>
@@ -215,10 +215,10 @@
       <p class="note">Secrets are masked. Leave a secret blank to keep its current value. Account names are set on each account.</p>
       <h3>AI messages</h3>
       <label for="openrouter_api_key">OpenRouter API key</label><input id="openrouter_api_key" type="text" autocomplete="off" spellcheck="false" class="secret">
-      <h3>Contact ledger (Supabase)</h3>
+      <h3>Member store (Supabase)</h3>
       <label for="supabase_url">Supabase URL</label><input id="supabase_url" type="url">
       <label for="supabase_key">Supabase key</label><input id="supabase_key" type="text" autocomplete="off" spellcheck="false" class="secret">
-      <h3>GitHub assessment access</h3>
+      <p class="note">Bots and the Supabase ledger page both use the <b>talent_profiles</b> table.</p>      <h3>GitHub assessment access</h3>
       <label for="github_token">GitHub token</label><input id="github_token" type="text" autocomplete="off" spellcheck="false" class="secret">
       <label for="github_owner">Repository owner</label><input id="github_owner" type="text">
       <label for="github_repo">Tech assessment repository</label><input id="github_repo" type="text" placeholder="Tech_Assessment"><p class="note">Full Stack, Backend and Frontend developers are invited here.</p>

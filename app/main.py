@@ -24,7 +24,7 @@ from .config import settings
 from .github import settings_ready
 from .db import ACCOUNT_ID_PATTERN, backup_database, connection, ensure_account, get_state, init_db, known_accounts, set_state, utc_now, vacuum
 from .mcp_client import result_text, AlreadyMessaged, ConversationUnavailable, HimalayasMCP, HimalayasUnavailable, letters_only, HimalayasRejected, LoginExpired, MCPError, authorization_url, authorized_accounts, exchange_code, login_state, oauth_status
-from .supabase_client import SupabaseError, SupabaseLedger, TalentProfiles, SENT as PROFILE_SENT
+from .supabase_client import SupabaseError, SupabaseLedger, TalentProfiles, SENT as PROFILE_SENT, SKIP as PROFILE_SKIP, QUEUED as PROFILE_QUEUED, FAILED as PROFILE_FAILED
 
 LOCAL_CLIENTS = {"127.0.0.1", "::1", "localhost", "testclient"}  # "testclient" is the address the test client reports. A real connection never has it
 LOGIN_FAILURES_BEFORE_BLOCK = 8
@@ -145,7 +145,10 @@ def reply_monitor_state(account_id: str) -> dict:
 
 
 def delivery_state(account_id: str) -> dict:
-    return delivery_states.setdefault(account_id, {"running": True, "status": "idle", "detail": "", "current_id": None, "current_name": None})
+    return delivery_states.setdefault(account_id, {
+        "running": True, "status": "idle", "detail": "", "current_id": None, "current_name": None,
+        "latest_recipient": None, "latest_status": None, "latest_error": None, "latest_at": None,
+    })
 
 
 OPS_LOG_KEEP = 500
@@ -554,11 +557,16 @@ async def check_settings(values: dict) -> tuple[list[str], list[str]]:
         if ("supabase_key" in values or "supabase_url" in values) and effective("supabase_url") and effective("supabase_key"):
             key = effective("supabase_key")
             try:
-                response = await client.get(f"{effective('supabase_url').rstrip('/')}/rest/v1/{effective('supabase_table')}", params={"select": "id", "limit": 1}, headers={"apikey": key, "Authorization": f"Bearer {key}"})
+                profiles_table = effective("supabase_profiles_table") or "talent_profiles"
+                response = await client.get(
+                    f"{effective('supabase_url').rstrip('/')}/rest/v1/{profiles_table}",
+                    params={"select": "id", "limit": 1},
+                    headers={"apikey": key, "Authorization": f"Bearer {key}"},
+                )
                 if response.status_code in (401, 403):
                     errors.append(f"Supabase rejected this key ({response.status_code}). Use the anon (publishable) key from Supabase > Project Settings > API.")
                 elif response.status_code == 404:
-                    warnings.append("Supabase accepted the key, but the contact table was not found. Run supabase_schema.sql in the Supabase SQL Editor.")
+                    warnings.append("Supabase accepted the key, but talent_profiles was not found. Run supabase_talent_profiles.sql in the Supabase SQL Editor.")
                 elif response.is_error:
                     warnings.append(f"Supabase answered {response.status_code}, so the key could not be verified.")
             except httpx.HTTPError:
@@ -646,6 +654,7 @@ async def save_settings(update: SettingsUpdate) -> dict:
         update_env_file(saved)
         holds.pop("ledger", None)  # a new key may fix the problem. Try again right away.
         SupabaseLedger._status_ready = None
+        TalentProfiles._columns = None
         for subscriber_account in set(dashboard_subscribers.values()):
             publish_dashboard_update("settings_updated", subscriber_account)
     return {**public_settings(), "warnings": warnings, "errors": problems, "saved": sorted(saved)}
@@ -867,16 +876,84 @@ async def profiles_sent_today(account_id: str) -> int:
                 },
             )
         if response.is_error:
-            return first_messages_today(account_id)
+            cached = _cached_profiles_daily(account_id)
+            return cached if cached is not None else first_messages_today(account_id)
         content_range = response.headers.get("content-range") or ""
+        count = None
         if "/" in content_range:
             try:
-                return int(content_range.rsplit("/", 1)[-1])
+                count = int(content_range.rsplit("/", 1)[-1])
             except ValueError:
-                pass
-        return len(response.json() or [])
+                count = None
+        if count is None:
+            count = len(response.json() or [])
+        _cache_profiles_daily(account_id, count)
+        return count
     except Exception:
-        return first_messages_today(account_id)
+        cached = _cached_profiles_daily(account_id)
+        return cached if cached is not None else first_messages_today(account_id)
+
+
+# Lifetime talent_profiles outreach totals per account (status column).
+_profiles_totals_cache: dict[str, dict[str, int]] = {}
+
+
+def _cache_profiles_totals(account_id: str, totals: dict[str, int]) -> None:
+    _profiles_totals_cache[account_id] = {
+        "sent": int(totals.get("sent", 0)),
+        "failed": int(totals.get("failed", 0)),
+        "skip": int(totals.get("skip", 0)),
+        "queued": int(totals.get("queued", 0)),
+    }
+
+
+def _cached_profiles_totals(account_id: str) -> dict[str, int]:
+    return dict(_profiles_totals_cache.get(account_id) or {"sent": 0, "failed": 0, "skip": 0, "queued": 0})
+
+
+def _bump_profiles_total(account_id: str, key: str, delta: int = 1) -> None:
+    totals = _cached_profiles_totals(account_id)
+    totals[key] = max(0, totals.get(key, 0) + delta)
+    _cache_profiles_totals(account_id, totals)
+
+
+async def profiles_outreach_totals(account_id: str) -> dict[str, int]:
+    """All-time counts on talent_profiles for this bot: sent / failed / skip / queued."""
+    empty = {"sent": 0, "failed": 0, "skip": 0, "queued": 0}
+    if not settings.supabase_url or not settings.supabase_key:
+        return empty
+    try:
+        profiles = TalentProfiles()
+        totals = dict(empty)
+        async with httpx.AsyncClient(timeout=25) as client:
+            for key, status in (
+                ("sent", PROFILE_SENT),
+                ("failed", PROFILE_FAILED),
+                ("skip", PROFILE_SKIP),
+                ("queued", PROFILE_QUEUED),
+            ):
+                response = await client.get(
+                    profiles.endpoint,
+                    headers={**profiles.headers, "Prefer": "count=exact"},
+                    params={
+                        "select": "id",
+                        "status": f"eq.{status}",
+                        "account_id": f"eq.{account_id}",
+                        "limit": "1",
+                    },
+                )
+                if response.is_error:
+                    continue
+                content_range = response.headers.get("content-range") or ""
+                if "/" in content_range:
+                    try:
+                        totals[key] = int(content_range.rsplit("/", 1)[-1])
+                    except ValueError:
+                        pass
+        _cache_profiles_totals(account_id, totals)
+        return totals
+    except Exception:
+        return _cached_profiles_totals(account_id)
 
 
 async def profiles_daily_status(account_id: str) -> dict:
@@ -917,87 +994,178 @@ async def process_talent_profile(account_id: str, row: dict, state: dict) -> str
     if blocked:
         await profiles.mark_skip(slug, account_id=account_id, account_label=label, error=blocked)
         state["skipped"] = state.get("skipped", 0) + 1
+        _bump_profiles_total(account_id, "skip", 1)
         return "skipped_blocked"
 
     if not await wait_for_send_window(account_id, state):
         await profiles.release_claim(slug, account_id)
         return "stopped"
 
+    from .ai import sparse_first_message, resolve_client
+
     state["status"] = f"drafting · {candidate['name']}"
     state["current_name"] = candidate["name"]
     delivery_state(account_id).update({"status": "sending", "current_name": candidate["name"], "current_id": None, "detail": ""})
-    recent = recent_first_messages(account_id)
-    try:
-        first = await write_first_message(candidate, recent=list(recent), account_id=account_id)
-    except Exception as exc:
-        await profiles.mark_failed(slug, account_id=account_id, account_label=label, error=f"Draft failed: {exc}")
-        delivery_state(account_id).update({"status": "failed", "current_name": None, "current_id": None})
-        return "failed_draft"
+    recent = list(recent_first_messages(account_id))
+    refused_bodies: list[str] = []
+    role = ""
+    body = ""
+    last_exc: Exception | None = None
 
-    body = first["message"]
-    state["status"] = f"sending · {candidate['name']}"
-    try:
-        await HimalayasMCP(account_id).send_message(slug, body, first_contact=True)
-    except LoginExpired as exc:
-        set_hold(account_id, str(exc))
-        await profiles.release_claim(slug, account_id)
-        delivery_state(account_id).update({"status": hold_hint(str(exc)), "detail": str(exc), "current_name": None})
-        return "held_login"
-    except AlreadyMessaged:
-        await profiles.mark_skip(
-            slug, account_id=account_id, account_label=label,
-            error="Already messaged on Himalayas (contacted before, for example by hand)",
-        )
-        state["skipped"] = state.get("skipped", 0) + 1
-        delivery_state(account_id).update({"status": "skipped", "current_name": None, "current_id": None})
-        return "skipped_already"
-    except ConversationUnavailable as exc:
-        await profiles.mark_skip(slug, account_id=account_id, account_label=label, error=str(exc))
-        state["skipped"] = state.get("skipped", 0) + 1
-        delivery_state(account_id).update({"status": "failed", "current_name": None, "current_id": None})
-        note_ops(account_id, "warn", "cannot reopen", str(exc))
-        return "skipped_unreachable"
-    except HimalayasUnavailable as exc:
-        # Temporary — keep claim released so the same or another bot can retry later.
-        await profiles.release_claim(slug, account_id)
-        pause = 60
-        reason = f"Himalayas unavailable ({str(exc)[:90]}). Retrying shortly."
-        holds["first:" + account_id] = {"reason": reason, "since": utc_now(), "until": time.monotonic() + pause}
-        delivery_state(account_id).update({"status": hold_hint(reason), "detail": reason, "current_name": None})
-        note_ops(account_id, "warn", hold_hint(reason), reason)
-        return "held_outage"
-    except HimalayasRejected as exc:
-        if is_rate_limit_error(exc):
-            # Keep queued claim? Plan: keep queued or retry. Release so we don't strand the row if this bot dies.
+    for attempt in range(1, MAX_REFUSALS_PER_MEMBER + 1):
+        if not await wait_for_send_window(account_id, state):
             await profiles.release_claim(slug, account_id)
-            reason = f"Rate limit reached (10 messages/minute). Please wait. Retrying shortly. {str(exc)[:120]}"
-            until = time.monotonic() + RATE_LIMIT_HOLD_SECONDS
-            next_first_message_at[account_id] = until
-            holds["first:" + account_id] = {"reason": reason, "since": utc_now(), "until": until}
+            return "stopped"
+        try:
+            if attempt > 1 and attempt - 1 >= SAFER_AFTER_REFUSALS:
+                company = resolve_client(account_id=account_id)["name"]
+                first = sparse_first_message(candidate, company)
+                if role:
+                    first["role"] = role
+            else:
+                first = await write_first_message(
+                    candidate,
+                    fixed_role=role or None,
+                    recent=recent + refused_bodies,
+                    account_id=account_id,
+                )
+            role = first["role"]
+            body = first["message"]
+        except Exception as exc:
+            await profiles.mark_failed(slug, account_id=account_id, account_label=label, error=f"Draft failed: {exc}")
+            _bump_profiles_total(account_id, "failed", 1)
+            delivery_state(account_id).update({"status": "failed", "current_name": None, "current_id": None})
+            return "failed_draft"
+
+        state["status"] = f"sending · {candidate['name']}" + (f" · try {attempt}" if attempt > 1 else "")
+        try:
+            await HimalayasMCP(account_id).send_message(slug, body, first_contact=True)
+            break
+        except LoginExpired as exc:
+            set_hold(account_id, str(exc))
+            await profiles.release_claim(slug, account_id)
+            delivery_state(account_id).update({"status": hold_hint(str(exc)), "detail": str(exc), "current_name": None})
+            return "held_login"
+        except AlreadyMessaged:
+            await profiles.mark_skip(
+                slug, account_id=account_id, account_label=label,
+                error="Already messaged on Himalayas (contacted before, for example by hand)",
+            )
+            state["skipped"] = state.get("skipped", 0) + 1
+            _bump_profiles_total(account_id, "skip", 1)
+            delivery_state(account_id).update({"status": "skipped", "current_name": None, "current_id": None})
+            return "skipped_already"
+        except ConversationUnavailable as exc:
+            await profiles.mark_skip(slug, account_id=account_id, account_label=label, error=str(exc))
+            state["skipped"] = state.get("skipped", 0) + 1
+            _bump_profiles_total(account_id, "skip", 1)
+            delivery_state(account_id).update({"status": "failed", "current_name": None, "current_id": None})
+            note_ops(account_id, "warn", "cannot reopen", str(exc))
+            return "skipped_unreachable"
+        except HimalayasUnavailable as exc:
+            # 401 / outage — release claim and hold briefly so reconnect or retry can happen.
+            await profiles.release_claim(slug, account_id)
+            detail = str(exc)
+            if "401" in detail or "login" in detail.lower() or "unauthorized" in detail.lower():
+                set_hold(account_id, f"Himalayas login problem: {detail[:160]}. Press Reconnect Himalayas.")
+                delivery_state(account_id).update({"status": "on hold · login", "detail": detail, "current_name": None})
+                note_ops(account_id, "warn", "on hold · login", detail)
+                return "held_login"
+            pause = 60
+            reason = f"Himalayas unavailable ({detail[:90]}). Retrying shortly."
+            holds["first:" + account_id] = {"reason": reason, "since": utc_now(), "until": time.monotonic() + pause}
             delivery_state(account_id).update({"status": hold_hint(reason), "detail": reason, "current_name": None})
             note_ops(account_id, "warn", hold_hint(reason), reason)
-            return "held_rate"
-        await profiles.mark_failed(slug, account_id=account_id, account_label=label, error=str(exc))
-        note_ops(account_id, "warn", "send refused", str(exc))
-        if any(word in str(exc).lower() for word in ("filter", "spam")):
-            note_first_refused(body)
-        delivery_state(account_id).update({"status": "send refused", "detail": str(exc), "current_name": None})
+            return "held_outage"
+        except HimalayasRejected as exc:
+            last_exc = exc
+            if is_rate_limit_error(exc):
+                await profiles.release_claim(slug, account_id)
+                reason = f"Rate limit reached (10 messages/minute). Please wait. Retrying shortly. {str(exc)[:120]}"
+                until = time.monotonic() + RATE_LIMIT_HOLD_SECONDS
+                next_first_message_at[account_id] = until
+                holds["first:" + account_id] = {"reason": reason, "since": utc_now(), "until": until}
+                delivery_state(account_id).update({"status": hold_hint(reason), "detail": reason, "current_name": None})
+                note_ops(account_id, "warn", hold_hint(reason), reason)
+                return "held_rate"
+            spam_refusal = any(word in str(exc).lower() for word in ("filter", "spam"))
+            hint = "refused · spam filter" if spam_refusal else "send refused"
+            note_ops(account_id, "warn", hint, str(exc))
+            delivery_state(account_id).update({"status": hint, "detail": str(exc), "current_name": candidate["name"]})
+            if spam_refusal:
+                note_first_refused(body)
+                refused_bodies.append(body)
+                recent.append(body)
+                # Streak of different members refused → short hold (same as local queue).
+                streak = rejection_streak.setdefault(account_id, [])
+                if slug not in streak:
+                    streak.append(slug)
+                if len(streak) >= REFUSED_MEMBERS_BEFORE_HOLD:
+                    hold_first_messages(account_id, str(exc))
+                now = time.monotonic()
+                window = [t for t in refusal_times.get(account_id, []) if now - t < REFUSAL_WINDOW_SECONDS] + [now]
+                refusal_times[account_id] = window
+                if len(window) >= REFUSALS_PER_WINDOW and not hold_active("first:" + account_id):
+                    detail = (
+                        f"Himalayas refused {len(window)} messages in {REFUSAL_WINDOW_SECONDS // 60} minutes, "
+                        f"so first messages wait {FIRST_HOLD_SECONDS // 60} minutes. {str(exc)[:120]}"
+                    )
+                    holds["first:" + account_id] = {
+                        "reason": detail, "since": utc_now(), "until": time.monotonic() + FIRST_HOLD_SECONDS,
+                    }
+                    note_ops(account_id, "warn", hold_hint(detail), detail)
+                if attempt < MAX_REFUSALS_PER_MEMBER:
+                    note_ops(
+                        account_id, "info", "retry · rewrite",
+                        f"Rewriting first message for {candidate['name']} (try {attempt + 1}/{MAX_REFUSALS_PER_MEMBER})",
+                    )
+                    await asyncio.sleep(random.uniform(*RETRY_PAUSE_SECONDS))
+                    continue
+            # Non-spam rejection, or out of rewrite tries.
+            await profiles.mark_failed(slug, account_id=account_id, account_label=label, error=str(exc)[:300])
+            _bump_profiles_total(account_id, "failed", 1)
+            delivery_state(account_id).update({
+                "status": hint, "detail": str(exc), "current_name": None,
+                "latest_recipient": candidate["name"], "latest_status": "failed",
+                "latest_error": str(exc)[:200], "latest_at": utc_now(),
+            })
+            return "failed_reject"
+        except Exception as exc:
+            await profiles.mark_failed(slug, account_id=account_id, account_label=label, error=str(exc)[:300])
+            _bump_profiles_total(account_id, "failed", 1)
+            delivery_state(account_id).update({"status": "failed", "current_name": None, "current_id": None})
+            return "failed"
+    else:
+        # Loop exhausted without break (should be covered by failed_reject).
+        err = str(last_exc or "Gave up after repeated refusals")[:300]
+        await profiles.mark_failed(slug, account_id=account_id, account_label=label, error=err)
+        _bump_profiles_total(account_id, "failed", 1)
+        delivery_state(account_id).update({"status": "send refused", "detail": err, "current_name": None})
         return "failed_reject"
-    except Exception as exc:
-        await profiles.mark_failed(slug, account_id=account_id, account_label=label, error=str(exc)[:300])
-        delivery_state(account_id).update({"status": "failed", "current_name": None, "current_id": None})
-        return "failed"
 
     sent_at = utc_now()
     await profiles.mark_sent(
         slug, account_id=account_id, account_label=label, message_body=body, sent_at=sent_at,
     )
+    rejection_streak.pop(account_id, None)
     note_first_message_sent(account_id)
     note_first_accepted(body)
     note_ops(account_id, "info", "sent · talent_profiles", f"Accepted first message to {candidate['name']}")
-    state["queued"] = state.get("queued", 0)  # keep key for UI
+    state["queued"] = state.get("queued", 0)
     state["sent"] = state.get("sent", 0) + 1
-    delivery_state(account_id).update({"status": "sent", "current_name": None, "current_id": None, "detail": ""})
+    cached = _cached_profiles_daily(account_id)
+    _cache_profiles_daily(account_id, (cached or 0) + 1)
+    _bump_profiles_total(account_id, "sent", 1)
+    delivery_state(account_id).update({
+        "status": "sent",
+        "current_name": None,
+        "current_id": None,
+        "detail": "",
+        "latest_recipient": candidate["name"],
+        "latest_status": "sent",
+        "latest_error": None,
+        "latest_at": sent_at,
+    })
     publish_dashboard_update("message_sent", account_id)
     return "sent"
 
@@ -1271,18 +1439,31 @@ async def progress(account: Account) -> dict:
             WHERE m.account_id=? AND m.direction='outbound' ORDER BY COALESCE(m.sent_at, m.created_at) DESC, m.id DESC LIMIT 1""",
             (account,),
         ).fetchone()
+    delivery = delivery_state(account)
+    automation = automation_state(account)
+    today = await profiles_daily_status(account) if settings.supabase_url and settings.supabase_key else daily_status(account)
+    profiles_totals = (
+        await profiles_outreach_totals(account)
+        if settings.supabase_url and settings.supabase_key
+        else {"sent": 0, "failed": 0, "skip": 0, "queued": 0}
+    )
+    next_name = delivery.get("current_name") or automation.get("current_name") or (next_message["name"] if next_message else None)
+    latest_name = delivery.get("latest_recipient") or (latest["name"] if latest else None)
+    latest_status = delivery.get("latest_status") or (latest["status"] if latest else None)
+    latest_error = delivery.get("latest_error") if delivery.get("latest_recipient") else (latest["error"] if latest else None)
     return {
         "total": sum(counts.values()),
-        "sent": counts.get("sent", 0),
-        "queued": counts.get("scheduled", 0) + counts.get("approved", 0) + counts.get("queued", 0),
-        "failed": counts.get("failed", 0),
-        "skipped": counts.get("skipped", 0),
-        "next_recipient": next_message["name"] if next_message else None,
+        "sent": profiles_totals.get("sent", 0),
+        "failed": profiles_totals.get("failed", 0),
+        "skipped": profiles_totals.get("skip", 0),
+        "queued": profiles_totals.get("queued", 0),
+        "profiles_totals": profiles_totals,
+        "next_recipient": next_name,
         "next_send_at": next_message["send_after"] if next_message else None,
-        "latest_recipient": latest["name"] if latest else None,
-        "latest_status": latest["status"] if latest else None,
-        "latest_error": latest["error"] if latest else None,
-        "daily": daily_status(account),
+        "latest_recipient": latest_name,
+        "latest_status": latest_status,
+        "latest_error": latest_error,
+        "daily": today,
     }
 
 
@@ -1511,6 +1692,7 @@ def account_overview(account_id: str, label: str, paused: bool, last_seen: str |
     login = login_state(account_id)
     authorized = login == "connected"
     automation = automation_state(account_id)
+    delivery = delivery_state(account_id)
     monitor = reply_monitor_state(account_id)
     failed_followups = sum(1 for m in members if m["failed_message_id"] and m["outreach_status"] != "failed")
     alerts = []
@@ -1545,16 +1727,28 @@ def account_overview(account_id: str, label: str, paused: bool, last_seen: str |
     online = extension_online(last_seen)
     if not online:
         alerts.insert(0, "Chrome extension offline or removed")
+    # Next / latest: prefer live talent_profiles automation over local scheduled queue (often empty).
+    next_name = delivery.get("current_name") or automation.get("current_name") or (next_message["name"] if next_message else None)
+    next_at = next_message["send_after"] if next_message else None
+    latest_recipient = delivery.get("latest_recipient")
+    latest_status = delivery.get("latest_status")
+    latest_error = delivery.get("latest_error")
+    latest_at = delivery.get("latest_at")
     from .hiring_client import get_hiring_client
     return {
         "id": account_id, "label": label, "paused": paused, "last_seen": last_seen, "extension_online": online,
         "hiring_client_name": get_hiring_client(account_id)["name"],
         "himalayas_authorized": authorized, "himalayas_login": login,
-        "automation": automation, "delivery": delivery_state(account_id), "reply_monitor": monitor, "daily": today,
+        "automation": automation, "delivery": delivery, "reply_monitor": monitor, "daily": today,
         "imported": imported, "members": len(members), "by_status": by_status,
         "replied": sum(1 for m in members if m["replies"]), "failed_followups": failed_followups, "unread": unread,
-        "next_send_at": next_message["send_after"] if next_message else None, "next_recipient": next_message["name"] if next_message else None,
-        "next_send_in": max(0.0, next_first_message_at.get(account_id, 0) - time.monotonic()),  # seconds the sender still waits before the next first message
+        "next_send_at": next_at, "next_recipient": next_name,
+        "next_send_in": max(0.0, next_first_message_at.get(account_id, 0) - time.monotonic()),
+        "latest_recipient": latest_recipient,
+        "latest_status": latest_status,
+        "latest_error": latest_error,
+        "latest_at": latest_at,
+        "profiles_totals": _cached_profiles_totals(account_id),
         "alerts": alerts,
     }
 
@@ -1655,28 +1849,29 @@ async def admin_ledger(
     limit: int = Query(default=50, ge=1, le=200),
     account_id: str | None = None,
 ) -> dict:
-    """Browse members stored in the shared Supabase contact ledger."""
+    """Browse every member in Supabase talent_profiles (the shared outreach store)."""
     if not settings.supabase_url or not settings.supabase_key:
         raise HTTPException(status_code=503, detail="Supabase is not configured. Add the URL and key under Settings.")
-    if status and status not in {"queued", "sent", "failed"}:
-        raise HTTPException(status_code=400, detail="status must be queued, sent, or failed")
+    allowed = {"not_sent", "pending", "queued", "sent", "failed", "skip"}
+    if status and status not in allowed:
+        raise HTTPException(status_code=400, detail=f"status must be one of: not_sent, queued, sent, failed, skip")
     try:
-        return await SupabaseLedger().list_contacts(status=status, q=q, offset=offset, limit=limit, account_id=account_id)
+        return await TalentProfiles().list_all(status=status, q=q, offset=offset, limit=limit, account_id=account_id)
     except SupabaseError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.get("/api/admin/ledger/{talent_slug}")
 async def admin_ledger_member(talent_slug: str) -> dict:
-    """One member's shared ledger row, plus any matching local profile rows."""
+    """One talent_profiles row, plus any matching local profile rows."""
     if not settings.supabase_url or not settings.supabase_key:
         raise HTTPException(status_code=503, detail="Supabase is not configured. Add the URL and key under Settings.")
     try:
-        contact = await SupabaseLedger().get_contact(talent_slug)
+        contact = await TalentProfiles().get(talent_slug)
     except SupabaseError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     if not contact:
-        raise HTTPException(status_code=404, detail="No ledger row for that member")
+        raise HTTPException(status_code=404, detail="No talent_profiles row for that member")
     with connection() as conn:
         local = [
             dict(row)
@@ -1690,7 +1885,8 @@ async def admin_ledger_member(talent_slug: str) -> dict:
                 (talent_slug,),
             )
         ]
-    return {"contact": contact, "local": local}
+    return {"contact": contact, "local": local, "source": "talent_profiles"}
+
 
 
 @app.get("/api/admin/ops-log")
@@ -1709,12 +1905,21 @@ async def admin_overview() -> dict:
     prune_empty_orphan_accounts()
     with connection() as conn:
         accounts = conn.execute("SELECT id, label, paused, last_seen, created_at FROM accounts ORDER BY created_at").fetchall()
+    # Refresh talent_profiles daily + lifetime totals (async — does not block the event loop).
+    for a in accounts:
+        if settings.supabase_url and settings.supabase_key:
+            try:
+                await profiles_sent_today(a["id"])
+                await profiles_outreach_totals(a["id"])
+            except Exception:
+                pass
     rows = [account_overview(a["id"], a["label"], bool(a["paused"]), a["last_seen"]) for a in accounts]
     # Mirror: Control center only lists extensions that are currently alive (heartbeating).
     online_rows = [r for r in rows if r["extension_online"]]
     ledger_error = None
     try:
-        ledger_ready = await SupabaseLedger().status_ready()
+        await TalentProfiles().columns()
+        ledger_ready = True
     except Exception as exc:
         ledger_ready, ledger_error = None, ledger_problem(exc) if settings.supabase_url and settings.supabase_key else None
     totals = {"accounts": len(online_rows), "offline": 0, "connected": sum(r["himalayas_authorized"] for r in online_rows),
@@ -1722,8 +1927,8 @@ async def admin_overview() -> dict:
               "automation_running": sum(1 for r in online_rows if r["automation"]["running"]), "members": sum(r["members"] for r in online_rows),
               "unread": sum(r.get("unread", 0) for r in online_rows)}
     for status in ("sent", "failed", "skipped"):
-        totals[status] = sum(r["by_status"].get(status, 0) for r in online_rows)
-    totals["queued"] = sum(r["by_status"].get(s, 0) for r in online_rows for s in ("queued", "scheduled", "approved"))
+        key = "skip" if status == "skipped" else status
+        totals[status] = sum((r.get("profiles_totals") or {}).get(key, 0) for r in online_rows)
     return {
         "server": {"ok": True, "time": utc_now()}, "totals": totals, "accounts": online_rows,
         "holds": [{"key": key, "reason": hold["reason"], "since": hold["since"]} for key, hold in holds.items()],
@@ -2338,12 +2543,39 @@ def first_messages_today(account_id: str) -> int:
         ).fetchone()[0]
 
 
+# talent_profiles daily send counts (UTC day). Updated on send and by async probes — never sync HTTP in request handlers.
+_profiles_daily_cache: dict[str, tuple[str, int]] = {}  # account_id → (utc_day_iso_date, count)
+
+
+def _cache_profiles_daily(account_id: str, sent: int) -> None:
+    _profiles_daily_cache[account_id] = (day_start().date().isoformat(), max(0, int(sent)))
+
+
+def _cached_profiles_daily(account_id: str) -> int | None:
+    row = _profiles_daily_cache.get(account_id)
+    if not row:
+        return None
+    day, count = row
+    if day != day_start().date().isoformat():
+        return None
+    return count
+
+
 def daily_status(account_id: str) -> dict:
+    """Daily first-message count. Prefer cached talent_profiles count (outreach source of truth)."""
     limit = settings.daily_dm_limit
-    sent = first_messages_today(account_id)
+    local = first_messages_today(account_id)
+    cached = _cached_profiles_daily(account_id)
+    sent = max(local, cached if cached is not None else 0)
     reset = day_start() + timedelta(days=1)
-    return {"limit": limit, "sent_today": sent, "remaining": max(0, limit - sent) if limit else None, "reached": bool(limit) and sent >= limit,
-            "resets_at": reset.isoformat(), "resets_in_seconds": int((reset - datetime.now(timezone.utc)).total_seconds())}
+    return {
+        "limit": limit,
+        "sent_today": sent,
+        "remaining": max(0, limit - sent) if limit else None,
+        "reached": bool(limit) and sent >= limit,
+        "resets_at": reset.isoformat(),
+        "resets_in_seconds": int((reset - datetime.now(timezone.utc)).total_seconds()),
+    }
 
 
 def daily_limit_reason(status: dict) -> str:

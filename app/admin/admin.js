@@ -29,7 +29,7 @@ function timeUntil(value) {
   if (seconds < 3600) return `in ${Math.round(seconds / 60)} min`;
   return `in ${(seconds / 3600).toFixed(1)} h`;
 }
-const STATUS_LABELS = {sent: 'Sent', failed: 'Failed', scheduled: 'Queued', approved: 'Approved', queued: 'Queued', skipped: 'Skipped', received: 'Received'};
+const STATUS_LABELS = {sent: 'Sent', failed: 'Failed', scheduled: 'Queued', approved: 'Approved', queued: 'Queued', skipped: 'Skipped', skip: 'Skip', not_sent: 'Not sent', pending: 'Not sent', received: 'Received'};
 const STAGE_LABELS = {first_sent: 'Message 1 sent', intro_sent: 'Introduced', experience_sent: 'Experience asked', process_sent: 'Process explained', assessment_sent: 'Assessment sent', invite_pending: 'Invite pending', invited: 'GitHub invited', apply_sent: 'Application link sent', closed: 'Closed'};
 const statusLabel = (status) => STATUS_LABELS[status] || status;
 const stageLabel = (stage) => (stage ? (STAGE_LABELS[stage] || (/^step_(\d+)$/.test(stage) ? `Message ${stage.slice(5)} sent` : stage)) : 'Not sent yet');
@@ -55,8 +55,8 @@ function renderHeader(overview) {
   const check = (ok, label, hint, warn = false) => `<span class="pill ${ok ? 'ok' : warn ? 'warn' : 'bad'}" title="${escapeHtml(hint)}">${ok ? '✓' : '✗'} ${escapeHtml(label)}</span>`;
   $('checks').innerHTML =
     check(c.openrouter_key, 'AI key', c.openrouter_key ? 'OpenRouter key is set' : 'Set the OpenRouter API key in Settings') +
-    check(c.supabase, 'Contact ledger', c.supabase ? 'Supabase is configured and accepts the key' : (c.supabase_error || 'Set the Supabase URL and key in Settings')) +
-    (c.ledger_status_ready === false ? check(false, 'Ledger statuses off', 'Run the updated supabase_schema.sql in Supabase to store queued and failed statuses', true) : c.ledger_status_ready === true ? check(true, 'Ledger statuses on', 'Queued and sent claims block other profiles') : '') +
+    check(c.supabase, 'talent_profiles', c.supabase ? 'Supabase talent_profiles is reachable' : (c.supabase_error || 'Set the Supabase URL and key in Settings')) +
+    (c.ledger_status_ready === false ? check(false, 'Profiles unreachable', 'Check SUPABASE_URL / key and that talent_profiles exists', true) : c.ledger_status_ready === true ? check(true, 'Ledger live', 'Dashboard ledger shows all talent_profiles rows') : '') +
     check(c.github, 'GitHub access', c.github ? 'GitHub token, owner and repository are set' : 'Set the GitHub token, owner and repository in Settings, or developer invitations will be held', true);
   $('updated').textContent = `Updated ${new Date().toLocaleTimeString([], {timeStyle: 'short'})}`;
   updateGlobalUnread((overview.totals && overview.totals.unread) || 0);
@@ -85,8 +85,7 @@ function markOffline(error) {
 function card(label, value, cls = '') { return `<div class="card ${cls}"><span>${escapeHtml(label)}</span><strong>${value}</strong></div>`; }
 function renderTotals(t) {
   $('totals').innerHTML = card('Accounts', t.accounts) + card('Connected', `${t.connected}/${t.accounts}`) + card('Automations running', t.automation_running) + card('Sending paused', t.paused) +
-    card('Members reached', t.members) + card('Sent', t.sent, 'sent') + card('Failed', t.failed, 'failed') + card('Queued', t.queued, 'queued') +
-    (t.unread ? card('Unread replies', t.unread, 'failed') : '');
+    card('Sent', t.sent || 0, 'sent') + card('Failed', t.failed || 0, 'failed') + card('Skipped', t.skipped || 0);
 }
 const shortStatus = (text) => { const line = String(text || '').split('\n')[0]; return line.length > 60 ? `${line.slice(0, 57)}…` : line; };
 function automationText(account) {
@@ -114,14 +113,13 @@ function dailyText(daily) {
 }
 const loginExpired = (account) => account.himalayas_login === 'expired';
 function accountCard(account) {
-  const b = account.by_status;
-  const queued = (b.queued || 0) + (b.scheduled || 0) + (b.approved || 0);
+  const pt = account.profiles_totals || {};
   const wait = Math.max(0, (new Date(account.next_send_at).getTime() - Date.now()) / 1000, account.next_send_in || 0);
   const next = account.next_recipient ? `${escapeHtml(account.next_recipient)} · ${wait < 3 ? 'now' : `in ${Math.round(wait)}s`}` : '—';
   const unread = account.unread || 0;
   return `<article class="acct${unread ? ' attention' : ''}" data-id="${escapeHtml(account.id)}">
     <div class="acct-head"><div><div class="acct-name" data-open="${escapeHtml(account.id)}"><span class="dot on"></span>${escapeHtml(account.label || 'Unnamed profile')}</div><div class="acct-id">${escapeHtml(account.id.slice(0, 10))}… · seen ${escapeHtml(timeAgo(account.last_seen))}</div></div><div class="acct-head-right">${unread ? `<span class="acct-unread" title="${unread} unread ${unread === 1 ? 'reply' : 'replies'}">${unread}</span>` : ''}${account.paused ? '<span class="pill warn">Paused</span>' : account.automation.running ? '<span class="pill ok">Running</span>' : '<span class="pill ok">Extension online</span>'}</div></div>
-    <div class="nums"><div><b>${account.members}</b><span>Members</span></div><div class="sent"><b>${b.sent || 0}</b><span>Sent</span></div><div class="failed"><b>${b.failed || 0}</b><span>Failed</span></div><div class="queued"><b>${queued}</b><span>Queued</span></div></div>
+    <div class="nums"><div class="sent"><b>${pt.sent || 0}</b><span>Sent</span></div><div class="failed"><b>${pt.failed || 0}</b><span>Failed</span></div><div><b>${pt.skip || 0}</b><span>Skipped</span></div></div>
     <div class="lines"><div><span>Extension</span><span>Online</span></div><div><span>Himalayas</span><span>${account.himalayas_login === 'none' ? 'Not connected' : loginExpired(account) ? 'Login expired' : 'Connected'}</span></div><div><span>Hiring for</span><span>${escapeHtml(account.hiring_client_name || '—')}</span></div><div><span>Automation</span><span>${escapeHtml(automationText(account))}</span></div><div><span>Sending</span><span>${escapeHtml(sendingText(account))}</span></div><div><span>Today</span><span>${escapeHtml(account.daily && account.daily.limit ? `${account.daily.sent_today} / ${account.daily.limit}` : `${account.daily ? account.daily.sent_today : 0} (no limit)`)}</span></div><div><span>Replies</span><span>${account.replied} replied${unread ? ` · ${unread} unread` : ''} · ${escapeHtml(shortStatus(account.reply_monitor.status))}</span></div><div><span>Next message</span><span>${next}</span></div></div>
     <div class="acct-actions">
       <button data-open="${escapeHtml(account.id)}" ${unread ? 'data-open-members="1"' : ''}>${unread ? `Open members (${unread} unread)` : 'Open'}</button>
@@ -297,19 +295,44 @@ async function loadAccountTab() {
 
 async function loadAccountOverview() {
   const id = state.accountId;
-  const [progress, activity, people] = await Promise.all([api('/api/progress', {}, id), api('/api/activity?limit=40', {}, id), api('/api/db/members?limit=1', {}, id)]);
-  const account = currentAccount(), by = people.summary;
-  // One count for each member (the status of the first message), so Sent + Queued + Failed + Skipped = Members.
-  const queuedMembers = (by.scheduled || 0) + (by.approved || 0) + (by.queued || 0);
-  $('progress-cards').innerHTML = card('Sent', by.sent || 0, 'sent') + card('Queued', queuedMembers, 'queued') + card('Failed', by.failed || 0, 'failed') + card('Skipped', by.skipped || 0) + card('Members', by.total) + card('Replied', account ? account.replied : '—') + (account && account.unread ? card('Unread', account.unread, 'failed') : '') +
-    `<p class="note" style="grid-column:1/-1">Each member is counted once, by the status of the first message. ${plural(progress.total, 'message')} in total including follow-ups and retries (${progress.sent} sent, ${progress.failed} failed).</p>`;
+  const [progress, activity] = await Promise.all([api('/api/progress', {}, id), api('/api/activity?limit=40', {}, id)]);
+  const account = currentAccount();
+  const a = account && account.automation ? account.automation : {};
+  // Always use fresh Supabase talent_profiles status counts from /api/progress.
+  const pt = progress.profiles_totals || {};
+  const sent = pt.sent || progress.sent || 0;
+  const failed = pt.failed || progress.failed || 0;
+  const skipped = pt.skip != null ? pt.skip : (progress.skipped || 0);
+  const runSent = a.sent != null ? a.sent : 0;
+  const runSkipped = a.skipped != null ? a.skipped : 0;
+  // Keep overview account object in sync so other views see the same totals.
+  if (account) account.profiles_totals = pt;
+  if (account && progress.daily) account.daily = progress.daily;
+  $('progress-cards').innerHTML =
+    card('Sent', sent, 'sent') +
+    card('Failed', failed, 'failed') +
+    card('Skipped', skipped) +
+    (account && account.unread ? card('Unread', account.unread, 'failed') : '') +
+    `<p class="note" style="grid-column:1/-1">Status cards are all-time counts from Supabase <b>talent_profiles</b> for this bot (status = sent / failed / skip). This run: ${runSent} sent, ${runSkipped} skipped. Daily limit uses today's sent count.</p>`;
   const live = account ? [
     ['Automation', automationText(account)], ['Sending', sendingText(account)], ['Daily limit', dailyText(account.daily)], ['Reply monitor', `${shortStatus(account.reply_monitor.status)} (${account.reply_monitor.detected} detected)`],
-    ['Next message', account.next_recipient ? `${account.next_recipient} · ${timeUntil(account.next_send_at)}` : '—'], ['Latest result', progress.latest_recipient ? `${progress.latest_recipient} · ${progress.latest_status}${progress.latest_error ? ` · ${progress.latest_error}` : ''}` : '—'],
-    ['Imported', `${plural(account.imported, 'candidate')}`],
+    ['Next message', (() => {
+      const name = account.next_recipient || (account.delivery && account.delivery.current_name) || progress.next_recipient;
+      if (!name) return '—';
+      if (account.next_send_in > 0) return `${name} · in ${Math.round(account.next_send_in)}s`;
+      return name;
+    })()],
+    ['Latest result', (() => {
+      const name = account.latest_recipient || progress.latest_recipient;
+      const status = account.latest_status || progress.latest_status;
+      if (!name) return '—';
+      const err = account.latest_error || progress.latest_error;
+      return `${name} · ${status || 'sent'}${err ? ` · ${err}` : ''}`;
+    })()],
+    ['Source', 'Supabase talent_profiles'],
   ] : [];
   $('live').innerHTML = live.map(([term, value]) => `<dt>${escapeHtml(term)}</dt><dd>${escapeHtml(value)}</dd>`).join('');
-  $('activity').innerHTML = activity.length ? activity.map((row) => `<div class="act-row"><div>${escapeHtml(row.name)}<br><small>${escapeHtml(row.direction)} · ${escapeHtml(formatDate(row.sent_at || row.send_after || row.created_at))}</small></div>${tag(row.status)}<span></span></div>`).join('') : '<p class="muted">No activity yet.</p>';
+  $('activity').innerHTML = activity.length ? activity.map((row) => `<div class="act-row"><div>${escapeHtml(row.name)}<br><small>${escapeHtml(row.direction)} · ${escapeHtml(formatDate(row.sent_at || row.send_after || row.created_at))}</small></div>${tag(row.status)}<span></span></div>`).join('') : '<p class="muted">No local activity yet (first sends update the Supabase ledger).</p>';
 }
 
 // ---------- members ----------
@@ -598,7 +621,13 @@ function ledgerChip(status, label) {
   return `<button type="button" class="chip${active ? ' active' : ''}" data-ledger-status="${escapeHtml(status)}">${escapeHtml(label)}</button>`;
 }
 function renderLedgerChips() {
-  $('ledger-chips').innerHTML = ledgerChip('', 'All') + ledgerChip('sent', 'Sent') + ledgerChip('queued', 'Queued') + ledgerChip('failed', 'Failed');
+  $('ledger-chips').innerHTML =
+    ledgerChip('', 'All') +
+    ledgerChip('not_sent', 'Not sent') +
+    ledgerChip('queued', 'Queued') +
+    ledgerChip('sent', 'Sent') +
+    ledgerChip('failed', 'Failed') +
+    ledgerChip('skip', 'Skip');
   $('ledger-chips').querySelectorAll('button').forEach((button) => {
     button.onclick = () => { state.ledger.status = button.dataset.ledgerStatus; state.ledger.offset = 0; loadLedger(); };
   });
@@ -608,12 +637,13 @@ function ledgerRow(contact) {
     ? `<a href="${escapeHtml(contact.profile_url)}" target="_blank" rel="noopener">${escapeHtml(contact.talent_slug || 'profile')}</a>`
     : escapeHtml(contact.talent_slug || '—');
   const when = contact.updated_at || contact.sent_at || contact.created_at || '';
-  return `<tr data-slug="${escapeHtml(contact.talent_slug || '')}"><td><span class="name">${escapeHtml(contact.candidate_name || '—')}</span><span class="sub">${escapeHtml(contact.account_label || contact.account_id || '—')}</span></td><td>${escapeHtml(contact.country || '—')}</td><td>${tag(contact.status || 'sent')}</td><td>${profile}</td><td>${escapeHtml(contact.category || '—')}</td><td>${escapeHtml(formatDate(when))}</td></tr>`;
+  const status = contact.status || 'not_sent';
+  return `<tr data-slug="${escapeHtml(contact.talent_slug || '')}"><td><span class="name">${escapeHtml(contact.candidate_name || '—')}</span><span class="sub">${escapeHtml(contact.account_label || contact.account_id || '—')}</span></td><td>${escapeHtml(contact.country || '—')}</td><td>${tag(status)}</td><td>${profile}</td><td>${escapeHtml(contact.category || '—')}</td><td>${escapeHtml(formatDate(when))}</td></tr>`;
 }
 function renderLedger() {
   renderLedgerChips();
   const L = state.ledger;
-  $('ledger-rows').innerHTML = L.items.length ? L.items.map(ledgerRow).join('') : `<tr><td colspan="6" class="empty">${L.busy ? 'Loading…' : 'No ledger rows match.'}</td></tr>`;
+  $('ledger-rows').innerHTML = L.items.length ? L.items.map(ledgerRow).join('') : `<tr><td colspan="6" class="empty">${L.busy ? 'Loading…' : 'No talent_profiles rows match.'}</td></tr>`;
   const page = Math.floor(L.offset / L.pageSize) + 1;
   const pages = Math.max(1, Math.ceil((L.total || 0) / L.pageSize));
   $('ledger-pager-info').textContent = `${Number(L.total || 0).toLocaleString()} member${L.total === 1 ? '' : 's'} · page ${page} of ${pages}`;
@@ -633,10 +663,10 @@ async function loadLedger() {
     const data = await api(`/api/admin/ledger?${params}`);
     L.items = data.contacts || [];
     L.total = data.total || 0;
-    $('ledger-note').textContent = `Shared Supabase ledger · ${Number(L.total).toLocaleString()} stored member${L.total === 1 ? '' : 's'}. Click a row for details.`;
+    $('ledger-note').textContent = `Supabase talent_profiles · ${Number(L.total).toLocaleString()} member${L.total === 1 ? '' : 's'} (same store bots use for outreach). Click a row for details.`;
   } catch (error) {
     L.items = []; L.total = 0;
-    $('ledger-note').textContent = `Could not load ledger: ${errorText(error)}`;
+    $('ledger-note').textContent = `Could not load talent_profiles: ${errorText(error)}`;
   }
   L.busy = false; renderLedger();
 }
@@ -650,19 +680,19 @@ async function openLedgerDetail(slug) {
     const c = data.contact || {};
     const local = data.local || [];
     $('detail-name').textContent = c.candidate_name || slug;
-    $('detail-sub').textContent = [c.country, c.status, c.account_label || c.account_id].filter(Boolean).join(' · ');
+    $('detail-sub').textContent = [c.country, statusLabel(c.status || 'not_sent'), c.account_label || c.account_id].filter(Boolean).join(' · ');
     const profile = c.profile_url ? `<a href="${escapeHtml(c.profile_url)}" target="_blank" rel="noopener">${escapeHtml(c.profile_url)}</a>` : '—';
     const stack = Array.isArray(c.stack) ? c.stack.join(', ') : (typeof c.stack === 'string' ? c.stack : '');
     const localHtml = local.length
       ? `<div class="table-wrap"><table class="plain"><thead><tr><th>Local profile</th><th>Country</th><th>Role</th><th>Sent</th><th>Replies</th></tr></thead><tbody>${local.map((row) => `<tr><td>${escapeHtml(row.account_label || row.account_id || '—')}</td><td>${escapeHtml(row.country || '—')}</td><td>${escapeHtml(row.suggested_role || '—')}</td><td>${row.sent || 0}</td><td>${row.replies || 0}</td></tr>`).join('')}</tbody></table></div>`
-      : '<p class="muted">No matching local member rows on this server (they may have been cleaned after uninstall).</p>';
+      : '<p class="muted">No matching local member rows on this server (first outreach uses talent_profiles only).</p>';
     $('detail-body').innerHTML =
-      `<dl class="facts"><dt>Slug</dt><dd>${escapeHtml(c.talent_slug || slug)}</dd><dt>Country</dt><dd>${escapeHtml(c.country || '—')}</dd><dt>Status</dt><dd>${tag(c.status || 'sent')}</dd><dt>Suggested role</dt><dd>${escapeHtml(c.category || '—')}</dd><dt>Profile</dt><dd>${profile}</dd><dt>Account</dt><dd>${escapeHtml(c.account_label || c.account_id || '—')}</dd><dt>Sent at</dt><dd>${escapeHtml(formatDate(c.sent_at))}</dd><dt>Updated</dt><dd>${escapeHtml(formatDate(c.updated_at || c.created_at))}</dd>${c.error ? `<dt>Error</dt><dd class="err">${escapeHtml(c.error)}</dd>` : ''}${stack ? `<dt>Stack</dt><dd>${escapeHtml(stack)}</dd>` : ''}</dl>` +
-      (c.message_body ? `<div><p class="group">LEDGER MESSAGE</p><div class="profile">${escapeHtml(c.message_body.slice(0, 2000))}</div></div>` : '') +
+      `<dl class="facts"><dt>Slug</dt><dd>${escapeHtml(c.talent_slug || slug)}</dd><dt>Country</dt><dd>${escapeHtml(c.country || '—')}</dd><dt>Status</dt><dd>${tag(c.status || 'not_sent')}</dd><dt>Category / role</dt><dd>${escapeHtml(c.category || '—')}</dd><dt>Profile</dt><dd>${profile}</dd><dt>Account</dt><dd>${escapeHtml(c.account_label || c.account_id || '—')}</dd><dt>Sent at</dt><dd>${escapeHtml(formatDate(c.sent_at))}</dd><dt>Updated</dt><dd>${escapeHtml(formatDate(c.updated_at || c.created_at))}</dd>${c.error ? `<dt>Error</dt><dd class="err">${escapeHtml(c.error)}</dd>` : ''}${stack ? `<dt>Stack</dt><dd>${escapeHtml(stack)}</dd>` : ''}</dl>` +
+      (c.message_body ? `<div><p class="group">OUTREACH MESSAGE</p><div class="profile">${escapeHtml(c.message_body.slice(0, 2000))}</div></div>` : '') +
       (c.summary ? `<div><p class="group">SUMMARY</p><div class="profile">${escapeHtml(String(c.summary).slice(0, 1500))}</div></div>` : '') +
       `<div><p class="group">LOCAL COPIES ON THIS SERVER</p>${localHtml}</div>`;
   } catch (error) {
-    $('detail-name').textContent = 'Could not load ledger member';
+    $('detail-name').textContent = 'Could not load member';
     $('detail-sub').textContent = errorText(error);
   }
 }
